@@ -41,7 +41,17 @@ npm run check
 npm run build
 ```
 
+Run the local package binary through npm with `--` so CLI flags are forwarded to SwitchYard instead of being consumed by `npm exec`:
+
+```sh
+npm exec -- switchyard --help
+npm exec -- switchyard --version
+npm exec -- switchyard doctor
+```
+
 ## Current CLI
+
+When `switchyard` is installed or linked on `PATH`:
 
 ```sh
 switchyard --help
