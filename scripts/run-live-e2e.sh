@@ -5,7 +5,7 @@ if [[ "${SWITCHYARD_LIVE:-}" != "1" ]]; then
   echo "live e2e is opt-in; run with SWITCHYARD_LIVE=1" >&2
   exit 2
 fi
-for tool in node git tmux pi; do
+for tool in node git tmux pi pgrep; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 
@@ -39,15 +39,25 @@ json_field() {
 }
 
 assert_runtime_quiesced() {
-  local window="$1" dead
-  if dead="$(tmux display-message -p -t "$SWITCHYARD_TMUX_SESSION:$window" '#{pane_dead}' 2>/dev/null)"; then
-    [[ "$dead" == "1" ]] || { echo "runtime window still authoritative: $window" >&2; fail; }
-  fi
+  local window="$1" window_id pane_pid start=$SECONDS timeout=30
+  while (( SECONDS - start < timeout )); do
+    if ! window_id="$(tmux list-windows -t "$SWITCHYARD_TMUX_SESSION" -F '#{window_id} #{window_name}' 2>/dev/null | awk -v name="$window" '$2 == name { print $1; exit }')"; then
+      return 0
+    fi
+    [[ -z "$window_id" ]] && return 0
+    if ! pane_pid="$(tmux display-message -p -t "$window_id" '#{pane_pid}' 2>/dev/null)"; then return 0; fi
+    # tmux may leave its interactive shell pane alive after the Pi process exits.
+    if ! pgrep -P "$pane_pid" -x pi >/dev/null 2>&1; then return 0; fi
+    sleep 0.2
+  done
+  echo "Pi runtime still active after ${timeout}s: $window" >&2
+  fail
 }
 
 wait_state() {
-  local task_id="$1" wanted="$2" timeout="${3:-180}" start now state
+  local task_id="$1" wanted="$2" timeout="${3:-180}" start now state last_reconcile
   start="$(date +%s)"
+  last_reconcile="$start"
   while true; do
     state="$(task_state "$task_id")" || fail
     if [[ "$state" == "$wanted" ]]; then return 0; fi
@@ -61,6 +71,10 @@ wait_state() {
       echo "timed out waiting for $task_id -> $wanted; current=$state" >&2
       task_json "$task_id" >&2 || true
       fail
+    fi
+    if (( now - last_reconcile >= 5 )); then
+      run_reconcile || fail
+      last_reconcile="$now"
     fi
     sleep 1
   done
@@ -86,7 +100,7 @@ grep -qx 'live-e2e' "$basic_workspace/README.md" || fail
 assert_runtime_quiesced "task-$basic_task"
 
 echo "2/5 idle steering + crash recovery with durable replacement context"
-resume_task="$("${CLI[@]}" task create "$project_id" --kind implement 'Immediately call switchyard_wait with reason awaiting-guidance. Do not modify files before waiting.')" || fail
+resume_task="$("${CLI[@]}" task create "$project_id" --kind implement 'On your first Worker turn, call switchyard_wait with reason awaiting-guidance before modifying files. After the Task resumes, follow the latest Worker message and do not wait again.')" || fail
 wait_state "$resume_task" waiting
 old_worker="$(json_field "$resume_task" 'x.events.filter(e=>e.type==="worker.started").at(-1) && JSON.parse(x.events.filter(e=>e.type==="worker.started").at(-1).payload_json).worker_id')"
 tmux kill-window -t "$SWITCHYARD_TMUX_SESSION:task-$resume_task" || fail

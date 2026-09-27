@@ -45,7 +45,7 @@ async function fixture() {
   const tmux = path.join(bin, "tmux");
   await writeFile(
     tmux,
-    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(stateFile)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) touch "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) : ;;\n  *) : ;;\nesac\n`,
+    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(stateFile)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) while IFS= read -r name; do printf '@1\\t%s\\n' "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) : ;;\n  *) : ;;\nesac\n`,
   );
   await chmod(tmux, 0o755);
   process.env.PATH = `${bin}:${originalPath}`;

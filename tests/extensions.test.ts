@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import type { PiExtensionApi, PiLifecycleEvent, PiToolDefinition } from "../extensions/pi-types.ts";
+import reviewerExtension from "../extensions/reviewer.ts";
 import supervisorExtension from "../extensions/supervisor.ts";
 import workerExtension from "../extensions/worker.ts";
 import { ensureSwitchYardHome } from "../src/home.ts";
@@ -116,6 +117,20 @@ test("idle Worker receives durable startup and wake-driven steering as Pi user m
 
   await fake.handlers.get("session_shutdown")?.();
   store.close();
+});
+
+test("Reviewer receives an initial review request as a Pi user message", async () => {
+  process.env.SWITCHYARD_REVIEW_ID = "review-1";
+  const fake = fakePi();
+  reviewerExtension(fake.api);
+
+  await fake.handlers.get("session_start")?.();
+
+  assert.deepEqual(fake.activeTools.at(-1), ["read", "switchyard_submit_review"]);
+  const initialMessage = fake.messages[0];
+  assert.ok(initialMessage);
+  assert.match(initialMessage.text, /Begin the independent review/);
+  assert.deepEqual(initialMessage.options, { deliverAs: "steer" });
 });
 
 test("Supervisor steering resumes a waiting Task through the shared domain operation", async () => {

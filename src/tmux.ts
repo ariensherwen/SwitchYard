@@ -20,27 +20,35 @@ export async function hasSession(): Promise<boolean> {
 }
 
 export async function windowAlive(window: string): Promise<boolean> {
+  const id = await findWindowId(window);
+  if (!id) return false;
   try {
-    const { stdout } = await tmux([
-      "display-message",
-      "-p",
-      "-t",
-      `${TMUX_SESSION}:${window}`,
-      "#{pane_dead}",
-    ]);
+    const { stdout } = await tmux(["display-message", "-p", "-t", id, "#{pane_dead}"]);
     return stdout.trim() === "0";
   } catch {
     return false;
   }
 }
 
-async function windowExists(window: string): Promise<boolean> {
+async function findWindowId(window: string): Promise<string | undefined> {
   try {
-    await tmux(["display-message", "-p", "-t", `${TMUX_SESSION}:${window}`, "#{window_id}"]);
-    return true;
+    const { stdout } = await tmux([
+      "list-windows",
+      "-t",
+      TMUX_SESSION,
+      "-F",
+      "#{window_id}\t#{window_name}",
+    ]);
+    for (const line of stdout.split(/\r?\n/)) {
+      const separator = line.indexOf("\t");
+      if (separator !== -1 && line.slice(separator + 1) === window) {
+        return line.slice(0, separator);
+      }
+    }
   } catch {
-    return false;
+    // A missing tmux session has no matching windows.
   }
+  return undefined;
 }
 
 export async function ensureWindow(window: string, cwd: string, command: string): Promise<void> {
@@ -49,20 +57,23 @@ export async function ensureWindow(window: string, cwd: string, command: string)
     return;
   }
   if (await windowAlive(window)) return;
-  if (await windowExists(window)) await killWindow(window);
+  if (await findWindowId(window)) await killWindow(window);
   await tmux(["new-window", "-d", "-t", TMUX_SESSION, "-n", window, "-c", cwd, command]);
 }
 
 export async function killWindow(window: string): Promise<void> {
+  const id = await findWindowId(window);
+  if (!id) return;
   try {
-    await tmux(["kill-window", "-t", `${TMUX_SESSION}:${window}`]);
+    await tmux(["kill-window", "-t", id]);
   } catch {
     // Missing windows are already stopped.
   }
 }
 
 export async function attachWindow(window: string): Promise<number> {
-  const target = `${TMUX_SESSION}:${window}`;
+  const target = await findWindowId(window);
+  if (!target) throw new Error(`tmux window not found: ${window}`);
   if (process.env.TMUX) {
     await tmux(["switch-client", "-t", target]);
     return 0;

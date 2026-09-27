@@ -293,6 +293,10 @@ function buildWorkerDispatchContext(
   if (!task || !workspace) throw new Error("task context is incomplete");
   const latestReview = store.getLatestReview(taskId);
   const findings = latestReview ? store.listFindings(latestReview.id) : [];
+  const taskResumed =
+    replacement &&
+    task.state === "running" &&
+    store.listEvents(taskId).some((event) => event.type === "task.resumed");
   const sections = [
     replacement ? "Resume this durable SwitchYard Task." : "Start this SwitchYard Task.",
     `Task ID: ${task.id}`,
@@ -311,6 +315,11 @@ function buildWorkerDispatchContext(
       `Outstanding review findings:\n${findings
         .map((finding, index) => `${index + 1}. ${finding.summary}: ${finding.required_change}`)
         .join("\n")}`,
+    );
+  }
+  if (taskResumed) {
+    sections.push(
+      "Recovery: this Task has already been resumed after a prior wait or Decision. Do not repeat that completed request. Continue from the existing Workspace and follow the latest Worker guidance in this dispatch.",
     );
   }
   return sections.join("\n\n");

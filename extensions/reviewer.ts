@@ -65,6 +65,10 @@ export default function reviewerExtension(pi: PiExtensionApi) {
 
   pi.on("session_start", async () => {
     pi.setActiveTools(REVIEWER_TOOLS);
+    await pi.sendUserMessage(
+      "Begin the independent review using the candidate context in your instructions. Submit exactly one structured result with switchyard_submit_review.",
+      { deliverAs: "steer" },
+    );
   });
   pi.on("session_shutdown", async () => {
     pi.setActiveTools([]);
