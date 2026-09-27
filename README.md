@@ -6,32 +6,67 @@ A local control plane for running and supervising Pi coding workers in tmux with
 
 0.1.0 is under development.
 
+The bootstrap currently launches the Supervisor Pi and provides prerequisite diagnostics. Task persistence, worktree lifecycle, tmux/Pi worker orchestration, steering, decisions, and recovery are not implemented yet.
+
 ## What it is
 
 ```text
-Pi supervisor
-    ↓
+you
+ ↓
+SwitchYard Supervisor (Pi)
+ ↓
 SwitchYard
-    ↓
-  tmux
-    ↓
+ ↓
+tmux
+ ↓
 Pi workers
-    ↓
+ ↓
 isolated Git worktrees
 ```
 
-## 0.1.0 scope
+## Quick start
 
-SwitchYard 0.1.0 is Pi-first, tmux-first, local-only, and targets Linux and macOS. The intended 0.1.0 scope includes Git worktrees, durable task state, steering, decisions, and restart recovery.
-
-Only the bootstrap CLI and prerequisite checks are implemented in this repository foundation. Task persistence, worktree lifecycle, tmux/Pi worker orchestration, steering, decisions, and recovery are not implemented yet.
-
-## Requirements
+Requirements:
 
 - Node >= 22.19
 - Git
 - tmux
 - Pi
+
+Clone and link SwitchYard:
+
+```sh
+git clone https://github.com/PrightCord/SwitchYard.git
+cd SwitchYard
+npm link
+```
+
+Then launch the Supervisor:
+
+```sh
+switchyard
+```
+
+SwitchYard starts Pi from the SwitchYard installation root with the Supervisor role. The linked package builds itself through npm's `prepare` lifecycle.
+
+## Current CLI
+
+```sh
+switchyard
+switchyard --help
+switchyard --version
+switchyard doctor
+```
+
+`switchyard doctor` checks Node, Git, tmux, and Pi without installing software, changing user configuration, checking model credentials, or contacting model providers.
+
+For development without a global link, use npm's argument separator so flags are forwarded to SwitchYard:
+
+```sh
+npm exec -- switchyard --help
+npm exec -- switchyard --version
+npm exec -- switchyard doctor
+```
 
 ## Development
 
@@ -41,25 +76,9 @@ npm run check
 npm run build
 ```
 
-Run the local package binary through npm with `--` so CLI flags are forwarded to SwitchYard instead of being consumed by `npm exec`:
+## 0.1.0 scope
 
-```sh
-npm exec -- switchyard --help
-npm exec -- switchyard --version
-npm exec -- switchyard doctor
-```
-
-## Current CLI
-
-When `switchyard` is installed or linked on `PATH`:
-
-```sh
-switchyard --help
-switchyard --version
-switchyard doctor
-```
-
-`switchyard doctor` checks Node, Git, tmux, and Pi without installing software, changing user configuration, checking model credentials, or contacting model providers.
+SwitchYard 0.1.0 is Pi-first, tmux-first, local-only, and targets Linux and macOS. The intended 0.1.0 scope includes Git worktrees, durable task state, steering, decisions, and restart recovery.
 
 ## Design
 

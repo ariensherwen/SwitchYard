@@ -17,12 +17,44 @@ afterEach(async () => {
   );
 });
 
-test("--help exits 0", async () => {
-  const result = await runCli(["--help"]);
+test("no arguments launches Pi as Supervisor from the SwitchYard root and propagates exit status", async () => {
+  const env = await fakeSupervisorPath(23);
+  const result = await runCli([], env);
+
+  assert.equal(result.code, 23);
+
+  const markers = Object.fromEntries(
+    result.stdout
+      .trim()
+      .split("\n")
+      .map((line) => line.split("=", 2)),
+  );
+
+  assert.equal(path.resolve(markers.cwd ?? ""), projectRoot);
+  assert.equal(path.resolve(markers.home ?? ""), projectRoot);
+  assert.equal(markers.supervisor, "1");
+  assert.match(markers.args ?? "", /--append-system-prompt/);
+  assert.match(markers.args ?? "", /SwitchYard Supervisor/);
+});
+
+test("missing Pi fails cleanly", async () => {
+  const env = await emptyPath();
+  const result = await runCli([], env);
+
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /Pi is not installed or not available on PATH/);
+  assert.match(result.stderr, /switchyard doctor/);
+});
+
+test("--help exits 0 without launching Pi", async () => {
+  const env = await fakeSupervisorPath(31);
+  const result = await runCli(["--help"], env);
 
   assert.equal(result.code, 0);
   assert.match(result.stdout, /SwitchYard/);
+  assert.match(result.stdout, /Launch Pi as the SwitchYard Supervisor/);
   assert.match(result.stdout, /doctor/);
+  assert.doesNotMatch(result.stdout, /supervisor=/);
 });
 
 test("--version exits 0 and prints package.json version", async () => {
@@ -43,7 +75,7 @@ test("unknown command exits non-zero", async () => {
 });
 
 test("doctor exit status propagates success", async () => {
-  const env = await fakePath(0);
+  const env = await fakeDoctorPath(0);
   const result = await runCli(["doctor"], env);
 
   assert.equal(result.code, 0);
@@ -51,7 +83,7 @@ test("doctor exit status propagates success", async () => {
 });
 
 test("doctor exit status propagates failure", async () => {
-  const env = await fakePath(7);
+  const env = await fakeDoctorPath(7);
   const result = await runCli(["doctor"], env);
 
   assert.notEqual(result.code, 0);
@@ -84,9 +116,8 @@ async function runCli(
   });
 }
 
-async function fakePath(piExitCode: number): Promise<NodeJS.ProcessEnv> {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "switchyard-cli-"));
-  tempDirectories.push(directory);
+async function fakeDoctorPath(piExitCode: number): Promise<NodeJS.ProcessEnv> {
+  const directory = await makeTempDirectory("switchyard-cli-doctor-");
 
   const tools = {
     node: { output: "v22.19.0", exitCode: 0 },
@@ -110,4 +141,40 @@ async function fakePath(piExitCode: number): Promise<NodeJS.ProcessEnv> {
     ...process.env,
     PATH: directory,
   };
+}
+
+async function fakeSupervisorPath(exitCode: number): Promise<NodeJS.ProcessEnv> {
+  const directory = await makeTempDirectory("switchyard-cli-supervisor-");
+  const executable = path.join(directory, "pi");
+
+  await writeFile(
+    executable,
+    `#!/bin/sh
+printf 'cwd=%s\\n' "$PWD"
+printf 'home=%s\\n' "$SWITCHYARD_HOME"
+printf 'supervisor=%s\\n' "$SWITCHYARD_SUPERVISOR"
+printf 'args=%s\\n' "$*"
+exit ${exitCode}
+`,
+  );
+  await chmod(executable, 0o755);
+
+  return {
+    ...process.env,
+    PATH: directory,
+  };
+}
+
+async function emptyPath(): Promise<NodeJS.ProcessEnv> {
+  const directory = await makeTempDirectory("switchyard-cli-empty-");
+  return {
+    ...process.env,
+    PATH: directory,
+  };
+}
+
+async function makeTempDirectory(prefix: string): Promise<string> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), prefix));
+  tempDirectories.push(directory);
+  return directory;
 }

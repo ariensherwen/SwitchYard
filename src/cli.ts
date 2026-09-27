@@ -1,13 +1,23 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { type DoctorReport, runDoctor } from "./doctor.js";
+
+const SWITCHYARD_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const SUPERVISOR_PROMPT =
+  "You are the SwitchYard Supervisor. Follow the Supervisor contract in CONTEXT.md. Do not claim capabilities that SwitchYard has not implemented.";
 
 const HELP = `SwitchYard
 
 Usage:
+  switchyard
   switchyard <command>
+
+Default:
+  Launch Pi as the SwitchYard Supervisor
 
 Commands:
   doctor    Check local SwitchYard prerequisites
@@ -40,9 +50,13 @@ async function main(args: string[]): Promise<number> {
     return 0;
   }
 
-  if (parsed.values.help || parsed.positionals.length === 0) {
+  if (parsed.values.help) {
     process.stdout.write(HELP);
     return 0;
+  }
+
+  if (parsed.positionals.length === 0) {
+    return await launchSupervisor();
   }
 
   const [command, ...rest] = parsed.positionals;
@@ -59,6 +73,44 @@ async function main(args: string[]): Promise<number> {
 
   console.error(`Unknown command: ${command}`);
   return 1;
+}
+
+async function launchSupervisor(): Promise<number> {
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolve(code);
+    };
+
+    const child = spawn("pi", ["--append-system-prompt", SUPERVISOR_PROMPT], {
+      cwd: SWITCHYARD_ROOT,
+      env: {
+        ...process.env,
+        SWITCHYARD_HOME: SWITCHYARD_ROOT,
+        SWITCHYARD_SUPERVISOR: "1",
+      },
+      stdio: "inherit",
+    });
+
+    child.once("error", (error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        console.error(
+          "Pi is not installed or not available on PATH. Run `switchyard doctor` to check prerequisites.",
+        );
+      } else {
+        console.error(`Failed to launch Pi: ${error.message}`);
+      }
+
+      finish(1);
+    });
+
+    child.once("close", (code) => finish(code ?? 1));
+  });
 }
 
 async function readPackageVersion(): Promise<string> {

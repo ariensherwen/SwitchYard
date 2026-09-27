@@ -10,6 +10,7 @@
     "node": ">=22.19"
   },
   "scripts": {
+    "prepare": "npm run build",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
