@@ -12,16 +12,17 @@ Initial task kinds are `implement` and `investigate`.
 
 Canonical lifecycle:
 
-```text
-queued
-  ↓
-running
-  ├─ waiting
-  ├─ needs_decision
-  ├─ completed
-  ├─ failed
-  └─ cancelled
-```
+| From | Allowed transitions |
+| --- | --- |
+| `queued` | `running`, `failed`, `cancelled` |
+| `running` | `waiting`, `needs_decision`, `completed`, `failed`, `cancelled` |
+| `waiting` | `running`, `failed`, `cancelled` |
+| `needs_decision` | `running`, `failed`, `cancelled` |
+| `completed` | none |
+| `failed` | none |
+| `cancelled` | none |
+
+`waiting` and `needs_decision` are resumable states. `completed`, `failed`, and `cancelled` are terminal. A Task may be cancelled from any nonterminal state, including `queued` before a Worker starts. A Task may fail from any nonterminal state, including startup or recovery failure before an active Worker exists.
 
 ## Worker
 

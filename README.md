@@ -47,7 +47,7 @@ Then launch the Supervisor:
 switchyard
 ```
 
-SwitchYard starts Pi from the SwitchYard installation root with the Supervisor role. The linked package builds itself through npm's `prepare` lifecycle.
+SwitchYard starts Pi from the SwitchYard installation root with the Supervisor role. The linked package builds itself through npm's `prepare` lifecycle; npm installs the package's development dependencies when linking from the package root.
 
 ## Current CLI
 
@@ -70,11 +70,13 @@ npm exec -- switchyard doctor
 
 ## Development
 
+Run the same acceptance path used by GitHub CI:
+
 ```sh
-npm ci
-npm run check
-npm run build
+./scripts/run-ci.sh
 ```
+
+It first verifies the documented fresh-clone `npm link` flow from a clean temporary copy, then runs the locked install, lint/typecheck/tests, build, and CLI version smoke test.
 
 ## 0.1.0 scope
 

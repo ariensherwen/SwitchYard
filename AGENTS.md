@@ -34,10 +34,10 @@ Do not generalize around hypothetical future harnesses, terminals, workspace pro
 # Workflow
 
 ```sh
-npm ci
-npm run check
-npm run build
+./scripts/run-ci.sh
 ```
+
+This is the local acceptance gate and should stay aligned with GitHub CI.
 
 # Documentation
 
