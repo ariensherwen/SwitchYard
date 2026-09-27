@@ -23,18 +23,15 @@ test("no arguments launches Pi as Supervisor from the SwitchYard root and propag
 
   assert.equal(result.code, 23);
 
-  const markers = Object.fromEntries(
-    result.stdout
-      .trim()
-      .split("\n")
-      .map((line) => line.split("=", 2)),
-  );
+  const lines = result.stdout.trim().split("\n");
+  const marker = (name: string) =>
+    lines.find((line) => line.startsWith(`${name}=`))?.slice(name.length + 1);
 
-  assert.equal(path.resolve(markers.cwd ?? ""), projectRoot);
-  assert.equal(path.resolve(markers.home ?? ""), projectRoot);
-  assert.equal(markers.supervisor, "1");
-  assert.match(markers.args ?? "", /--append-system-prompt/);
-  assert.match(markers.args ?? "", /SwitchYard Supervisor/);
+  assert.equal(path.resolve(marker("cwd") ?? ""), projectRoot);
+  assert.equal(path.resolve(marker("home") ?? ""), projectRoot);
+  assert.equal(marker("supervisor"), "1");
+  assert.match(marker("args") ?? "", /--append-system-prompt/);
+  assert.match(marker("args") ?? "", /SwitchYard Supervisor/);
 });
 
 test("missing Pi fails cleanly", async () => {
