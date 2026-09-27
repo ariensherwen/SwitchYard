@@ -76,7 +76,7 @@ async function main(args: string[]): Promise<number> {
 }
 
 async function launchSupervisor(): Promise<number> {
-  return await new Promise((resolve) => {
+  return await new Promise<number>((resolve) => {
     let settled = false;
     const finish = (code: number) => {
       if (settled) {
