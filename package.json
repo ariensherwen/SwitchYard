@@ -4,13 +4,12 @@
   "description": "A local control plane for running and supervising Pi coding workers in tmux with isolated Git worktrees and durable task state.",
   "type": "module",
   "bin": {
-    "switchyard": "./dist/cli.js"
+    "switchyard": "./bin/switchyard.mjs"
   },
   "engines": {
     "node": ">=22.19"
   },
   "scripts": {
-    "prepare": "npm run build",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",

@@ -47,7 +47,7 @@ Then launch the Supervisor:
 switchyard
 ```
 
-SwitchYard starts Pi from the SwitchYard installation root with the Supervisor role. The linked package builds itself through npm's `prepare` lifecycle; npm installs the package's development dependencies when linking from the package root.
+SwitchYard starts Pi from the SwitchYard installation root with the Supervisor role. The linked command does not rely on npm lifecycle scripts or a prebuilt `dist/` directory; on Node >= 22.19 it can execute the checkout's erasable TypeScript source directly.
 
 ## Current CLI
 

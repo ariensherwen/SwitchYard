@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { type DoctorReport, runDoctor } from "./doctor.js";
+import { type DoctorReport, runDoctor } from "./doctor.ts";
 
 const SWITCHYARD_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SUPERVISOR_PROMPT =
