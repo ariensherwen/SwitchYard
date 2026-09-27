@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { realpath, rm } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -17,10 +17,7 @@ export async function canonicalRepositoryRoot(input: string): Promise<string> {
   return await realpath(stdout.trim());
 }
 
-export async function assertRegisterableProject(
-  root: string,
-  switchyardWorktrees: string,
-): Promise<void> {
+export async function assertRegisterableProject(root: string, switchyardWorktrees: string): Promise<void> {
   const canonical = await realpath(root);
   const generated = path.resolve(switchyardWorktrees) + path.sep;
   if ((canonical + path.sep).startsWith(generated)) {
@@ -68,61 +65,36 @@ export async function validateImplementCandidate(
   return head;
 }
 
-export async function validateInvestigateCompletion(
-  workspace: string,
-  baseSha: string,
-): Promise<void> {
+export async function validateInvestigateCompletion(workspace: string, baseSha: string): Promise<void> {
   const status = (await git(workspace, ["status", "--porcelain"])).stdout.trim();
   if (status) throw new Error("investigate workspace must remain clean");
   const head = await currentHead(workspace);
   if (head !== baseSha) throw new Error("investigate task must not create source commits");
 }
 
-export async function changedPaths(
-  workspace: string,
-  baseSha: string,
-  candidateSha: string,
-): Promise<string[]> {
+export async function changedPaths(workspace: string, baseSha: string, candidateSha: string): Promise<string[]> {
   const { stdout } = await git(workspace, ["diff", "--name-only", `${baseSha}..${candidateSha}`]);
-  return stdout
-    .split("\n")
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .sort();
+  return stdout.split("\n").map((value) => value.trim()).filter(Boolean).sort();
 }
 
-export async function diffText(
-  workspace: string,
-  baseSha: string,
-  candidateSha: string,
-): Promise<string> {
+export async function diffText(workspace: string, baseSha: string, candidateSha: string): Promise<string> {
   return (await git(workspace, ["diff", "--no-ext-diff", `${baseSha}..${candidateSha}`])).stdout;
 }
 
-export async function createReviewWorktree(
-  projectRoot: string,
-  reviewPath: string,
-  candidateSha: string,
-): Promise<void> {
+export async function createReviewWorktree(projectRoot: string, reviewPath: string, candidateSha: string): Promise<void> {
   await git(projectRoot, ["worktree", "add", "--detach", reviewPath, candidateSha]);
 }
 
-export async function validateReviewCheckout(
-  reviewPath: string,
-  candidateSha: string,
-): Promise<void> {
+export async function validateReviewCheckout(reviewPath: string, candidateSha: string): Promise<void> {
   const head = await currentHead(reviewPath);
-  if (head !== candidateSha)
-    throw new Error("review checkout no longer points at the candidate revision");
+  if (head !== candidateSha) throw new Error("review checkout no longer points at the candidate revision");
   const status = (await git(reviewPath, ["status", "--porcelain"])).stdout.trim();
   if (status) throw new Error("review checkout must be clean before certification");
 }
 
-export async function canSafelyClean(
-  projectRoot: string,
-  workspace: string,
-  baseSha: string,
-): Promise<boolean> {
+export async function canSafelyClean(projectRoot: string, workspace: string, baseSha: string): Promise<boolean> {
+  const status = (await git(workspace, ["status", "--porcelain"])).stdout.trim();
+  if (status) return false;
   const head = await currentHead(workspace);
   if (head === baseSha) return true;
   const projectHead = await currentHead(projectRoot);
@@ -135,13 +107,9 @@ export async function canSafelyClean(
 }
 
 export async function removeWorktree(projectRoot: string, workspace: string): Promise<void> {
-  try {
-    await git(projectRoot, ["worktree", "remove", workspace]);
-  } catch (error) {
-    await rm(workspace, { recursive: true, force: true });
-    await git(projectRoot, ["worktree", "prune"]);
-    throw error;
-  }
+  // Never force-delete a Task workspace. If Git refuses removal, preserve the workspace
+  // and surface the error so a human can inspect it.
+  await git(projectRoot, ["worktree", "remove", workspace]);
 }
 
 async function git(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {

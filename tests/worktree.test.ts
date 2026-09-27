@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 import {
-  canonicalRepositoryRoot,
   canSafelyClean,
+  canonicalRepositoryRoot,
   createWorkspace,
   validateImplementCandidate,
+  removeWorktree,
 } from "../src/worktree.ts";
 
 const exec = promisify(execFile);
@@ -65,4 +66,19 @@ test("dirty registered project is rejected before worktree creation", async () =
     () => createWorkspace(root, `${root}-worktree`, "switchyard/task-t2"),
     /checkout is dirty/,
   );
+});
+
+
+test("cleanup refuses dirty worktree and failed Git removal preserves files", async () => {
+  const root = await repo();
+  const workspace = `${root}-dirty-worktree`;
+  dirs.push(workspace);
+  const info = await createWorkspace(root, workspace, "switchyard/task-dirty");
+  const dirtyFile = path.join(workspace, "dirty.txt");
+  await writeFile(dirtyFile, "valuable uncommitted work\n");
+
+  assert.equal(await canSafelyClean(root, workspace, info.baseSha), false);
+  await assert.rejects(() => removeWorktree(root, workspace));
+  await access(workspace);
+  await access(dirtyFile);
 });

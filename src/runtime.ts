@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { SwitchYardPaths } from "./home.ts";
+import { enqueueMessage, signalWake } from "./inbox.ts";
 import { buildPiLaunch, shellCommand } from "./pi.ts";
-import type { StateStore } from "./state.ts";
+import type { StateStore, WorkerRecord } from "./state.ts";
 import { now } from "./state.ts";
-import { markRunning } from "./tasks.ts";
-import { ensureWindow, killWindow, sendWake } from "./tmux.ts";
+import { casTransition } from "./tasks.ts";
+import { ensureWindow, killWindow, windowAlive } from "./tmux.ts";
+import { changedPaths, diffText, removeWorktree } from "./worktree.ts";
 
 export async function startWorker(
   store: StateStore,
@@ -13,52 +16,30 @@ export async function startWorker(
 ): Promise<string> {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
-  if (task?.state !== "starting" || !workspace)
+  if (!task || task.state !== "starting" || !workspace) {
     throw new Error("task is not ready to start a worker");
-  const workerId = randomUUID();
-  const window = `task-${taskId}`;
-  const prompt = `You are the SwitchYard Worker for task ${taskId}. Work only in this task workspace. Use SwitchYard lifecycle tools for decisions, waiting, and completion.`;
-  const launch = buildPiLaunch(
-    "worker",
-    workspace.path,
-    {
-      SWITCHYARD_HOME: paths.home,
-      SWITCHYARD_TASK_ID: taskId,
-      SWITCHYARD_WORKER_ID: workerId,
-    },
-    prompt,
-  );
-  await ensureWindow(window, launch.cwd, shellCommand(launch));
-  store.transaction(() => {
-    store.db
-      .prepare(`INSERT INTO workers(id, task_id, state, tmux_window, created_at)
-      VALUES (?, ?, 'active', ?, ?)`)
-      .run(workerId, taskId, window, now());
-    store.event(taskId, "worker.started", { worker_id: workerId, window });
-  });
-  markRunning(store, taskId);
-  return workerId;
-}
+  }
 
-export async function stopWorker(store: StateStore, taskId: string): Promise<void> {
-  const worker = store.getActiveWorker(taskId);
-  if (!worker) return;
-  await killWindow(worker.tmux_window);
-  store.transaction(() => {
-    store.db
-      .prepare("UPDATE workers SET state='stopped', ended_at=? WHERE id=? AND state='active'")
-      .run(now(), worker.id);
-    store.event(taskId, "worker.stopped", { worker_id: worker.id });
-  });
-}
+  let worker = store.getLiveWorker(taskId);
+  if (worker?.state === "active") {
+    if (await windowAlive(worker.tmux_window)) {
+      activateWorkerAndTask(store, taskId, worker.id);
+      return worker.id;
+    }
+    retireWorker(store, taskId, worker.id, "startup runtime disappeared");
+    worker = undefined;
+  }
+  if (!worker) worker = reserveWorker(store, taskId, false);
 
-export async function wakeSupervisor(): Promise<void> {
-  await sendWake("supervisor");
-}
-
-export async function wakeWorker(store: StateStore, taskId: string): Promise<void> {
-  const worker = store.getActiveWorker(taskId);
-  if (worker) await sendWake(worker.tmux_window);
+  try {
+    await launchReservedWorker(store, paths, worker);
+    activateWorkerAndTask(store, taskId, worker.id);
+    return worker.id;
+  } catch (error) {
+    await killWindow(worker.tmux_window);
+    retireWorker(store, taskId, worker.id, "worker launch failed");
+    throw error;
+  }
 }
 
 export async function replaceWorker(
@@ -68,33 +49,196 @@ export async function replaceWorker(
 ): Promise<string> {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
-  if (task?.state !== "running" || !workspace)
+  if (!task || task.state !== "running" || !workspace) {
     throw new Error("task is not ready for a replacement Worker");
-  const existing = store.getActiveWorker(taskId);
-  if (existing) {
-    store.db
-      .prepare("UPDATE workers SET state='stopped', ended_at=? WHERE id=? AND state='active'")
-      .run(now(), existing.id);
   }
+
+  const live = store.getLiveWorker(taskId);
+  if (live?.state === "starting") {
+    try {
+      await launchReservedWorker(store, paths, live);
+      activateReservedWorker(store, taskId, live.id);
+      return live.id;
+    } catch (error) {
+      await killWindow(live.tmux_window);
+      retireWorker(store, taskId, live.id, "replacement launch failed");
+      throw error;
+    }
+  }
+  if (live?.state === "active") {
+    if (await windowAlive(live.tmux_window)) return live.id;
+    retireWorker(store, taskId, live.id, "worker runtime disappeared");
+  }
+
+  const worker = reserveWorker(store, taskId, true);
+  try {
+    await launchReservedWorker(store, paths, worker);
+    activateReservedWorker(store, taskId, worker.id);
+    return worker.id;
+  } catch (error) {
+    await killWindow(worker.tmux_window);
+    retireWorker(store, taskId, worker.id, "replacement launch failed");
+    throw error;
+  }
+}
+
+export async function resumeReservedWorker(
+  store: StateStore,
+  paths: SwitchYardPaths,
+  worker: WorkerRecord,
+): Promise<void> {
+  if (worker.state !== "starting") throw new Error("worker is not reserved for startup");
+  await launchReservedWorker(store, paths, worker);
+  const task = store.getTask(worker.task_id);
+  if (!task) throw new Error("task not found for reserved worker");
+  if (task.state === "starting") activateWorkerAndTask(store, task.id, worker.id);
+  else if (task.state === "running") activateReservedWorker(store, task.id, worker.id);
+  else throw new Error(`cannot activate reserved worker while task is ${task.state}`);
+}
+
+function reserveWorker(store: StateStore, taskId: string, replacement: boolean): WorkerRecord {
+  if (store.getLiveWorker(taskId)) throw new Error("task already has a live Worker identity");
   const workerId = randomUUID();
   const window = `task-${taskId}`;
-  const prompt = `You are a replacement SwitchYard Worker for task ${taskId}. Continue in the existing task workspace. Inspect durable task context and outstanding review findings before acting.`;
-  const launch = buildPiLaunch(
-    "worker",
-    workspace.path,
-    { SWITCHYARD_HOME: paths.home, SWITCHYARD_TASK_ID: taskId, SWITCHYARD_WORKER_ID: workerId },
-    prompt,
-  );
-  await ensureWindow(window, launch.cwd, shellCommand(launch));
   store.transaction(() => {
     store.db
       .prepare(
-        `INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'active', ?, ?)`,
+        `INSERT INTO workers(id, task_id, state, tmux_window, created_at)
+         VALUES (?, ?, 'starting', ?, ?)`,
       )
       .run(workerId, taskId, window, now());
-    store.event(taskId, "worker.replaced", { worker_id: workerId, window });
+    store.event(taskId, "worker.reserved", { worker_id: workerId, window, replacement });
+    enqueueMessage(store, taskId, "worker", buildWorkerDispatchContext(store, taskId, replacement));
   });
-  return workerId;
+  const worker = store.getLiveWorker(taskId);
+  if (!worker || worker.id !== workerId) throw new Error("failed to reserve Worker identity");
+  return worker;
+}
+
+async function launchReservedWorker(
+  store: StateStore,
+  paths: SwitchYardPaths,
+  worker: WorkerRecord,
+): Promise<void> {
+  const workspace = store.getWorkspace(worker.task_id);
+  if (!workspace) throw new Error("worker workspace not found");
+  const prompt =
+    `You are the SwitchYard Worker for task ${worker.task_id}. ` +
+    "Work only in this task Workspace. The durable Task instruction/context arrives as Pi user input. " +
+    "Use SwitchYard lifecycle tools for decisions, waiting, and completion.";
+  const launch = buildPiLaunch(
+    "worker",
+    workspace.path,
+    {
+      SWITCHYARD_HOME: paths.home,
+      SWITCHYARD_TASK_ID: worker.task_id,
+      SWITCHYARD_WORKER_ID: worker.id,
+    },
+    prompt,
+  );
+  await ensureWindow(worker.tmux_window, launch.cwd, shellCommand(launch));
+  if (!(await windowAlive(worker.tmux_window))) throw new Error("Pi Worker exited during startup");
+}
+
+function activateWorkerAndTask(store: StateStore, taskId: string, workerId: string): void {
+  store.transaction(() => {
+    const worker = store.db
+      .prepare("UPDATE workers SET state='active' WHERE id=? AND task_id=? AND state IN ('starting','active')")
+      .run(workerId, taskId);
+    if (worker.changes !== 1) throw new Error("reserved Worker identity is no longer live");
+    casTransition(store, taskId, "starting", "running");
+    store.event(taskId, "worker.started", { worker_id: workerId });
+    store.event(taskId, "task.started", { worker_id: workerId });
+    enqueueMessage(store, taskId, "supervisor", `Task ${taskId} started`);
+  });
+}
+
+function activateReservedWorker(store: StateStore, taskId: string, workerId: string): void {
+  store.transaction(() => {
+    const changed = store.db
+      .prepare("UPDATE workers SET state='active' WHERE id=? AND task_id=? AND state='starting'")
+      .run(workerId, taskId);
+    if (changed.changes !== 1) throw new Error("reserved Worker identity is no longer starting");
+    store.event(taskId, "worker.started", { worker_id: workerId, replacement: true });
+  });
+}
+
+export async function stopWorker(store: StateStore, taskId: string): Promise<void> {
+  const worker = store.getLiveWorker(taskId);
+  if (!worker) return;
+  await killWindow(worker.tmux_window);
+  retireWorker(store, taskId, worker.id, "runtime stopped");
+}
+
+export function retireWorker(
+  store: StateStore,
+  taskId: string,
+  workerId: string,
+  reason = "runtime retired",
+): void {
+  store.transaction(() => {
+    const changed = store.db
+      .prepare(
+        "UPDATE workers SET state='stopped', ended_at=? WHERE id=? AND task_id=? AND state IN ('starting','active')",
+      )
+      .run(now(), workerId, taskId);
+    if (changed.changes === 1) store.event(taskId, "worker.stopped", { worker_id: workerId, reason });
+  });
+}
+
+export async function stopReviewer(store: StateStore, taskId: string): Promise<void> {
+  const review = store.getLatestReview(taskId);
+  if (!review || review.state !== "running") return;
+  await killWindow(review.tmux_window);
+  store.event(taskId, "reviewer.stopped", { review_id: review.id });
+}
+
+export async function quiesceTaskRuntimes(
+  store: StateStore,
+  taskId: string,
+  options: { keepReviewId?: string } = {},
+): Promise<void> {
+  await stopWorker(store, taskId);
+  const review = store.getLatestReview(taskId);
+  if (review && review.id !== options.keepReviewId) {
+    await killWindow(review.tmux_window);
+    store.event(taskId, "reviewer.stopped", { review_id: review.id });
+  }
+}
+
+export async function cleanupFinishedReviewRuntime(
+  store: StateStore,
+  reviewId: string,
+): Promise<void> {
+  const review = store.getReview(reviewId);
+  if (!review || review.state === "running") return;
+  await killWindow(review.tmux_window);
+  if (!existsSync(review.path)) return;
+  const task = store.getTask(review.task_id);
+  const project = task ? store.getProject(task.project_id) : undefined;
+  if (!project) return;
+  try {
+    await removeWorktree(project.root_path, review.path);
+    store.event(review.task_id, "review.runtime_cleaned", { review_id: review.id });
+  } catch (error) {
+    store.event(review.task_id, "review.cleanup_failed", {
+      review_id: review.id,
+      failure: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+export async function wakeSupervisor(paths: SwitchYardPaths): Promise<void> {
+  await signalWake(paths.wake, "supervisor.wake");
+}
+
+export async function wakeWorker(
+  store: StateStore,
+  paths: SwitchYardPaths,
+  taskId: string,
+): Promise<void> {
+  const worker = store.getActiveWorker(taskId);
+  if (worker) await signalWake(paths.wake, `worker-${worker.id}.wake`);
 }
 
 export async function startReviewer(
@@ -103,10 +247,23 @@ export async function startReviewer(
   reviewId: string,
 ): Promise<void> {
   const review = store.getReview(reviewId);
-  if (review?.state !== "running") throw new Error("review is not running");
+  if (!review || review.state !== "running") throw new Error("review is not running");
   const task = store.getTask(review.task_id);
-  if (!task?.base_sha) throw new Error("task/base revision not found");
-  const prompt = `You are an independent SwitchYard Reviewer for task ${task.id}. Review the entire candidate revision ${review.candidate_sha} against the original instruction. Do not modify the worker workspace. Submit exactly one structured review result with switchyard_submit_review.`;
+  const workspace = store.getWorkspace(review.task_id);
+  if (!task || !task.base_sha || !workspace) throw new Error("task/base/workspace not found");
+  const pathsChanged = await changedPaths(workspace.path, task.base_sha, review.candidate_sha);
+  const diff = await diffText(workspace.path, task.base_sha, review.candidate_sha);
+  const prompt = [
+    `You are an independent SwitchYard Reviewer for task ${task.id}.`,
+    "Do not modify files. Review only the exact detached candidate revision in your current directory.",
+    `Original instruction:\n${task.instruction}`,
+    `Worker completion summary:\n${task.summary ?? "(none)"}`,
+    `Worker verification summary:\n${task.verification_summary ?? "(none)"}`,
+    `Candidate SHA: ${review.candidate_sha}`,
+    `Changed paths:\n${pathsChanged.join("\n") || "(none)"}`,
+    `Candidate diff:\n${diff || "(empty diff)"}`,
+    "Submit exactly one structured result with switchyard_submit_review.",
+  ].join("\n\n");
   const launch = buildPiLaunch(
     "reviewer",
     review.path,
@@ -118,5 +275,35 @@ export async function startReviewer(
     prompt,
   );
   await ensureWindow(review.tmux_window, launch.cwd, shellCommand(launch));
+  if (!(await windowAlive(review.tmux_window))) throw new Error("Reviewer Pi exited during startup");
   store.event(task.id, "reviewer.started", { review_id: reviewId, window: review.tmux_window });
+}
+
+function buildWorkerDispatchContext(store: StateStore, taskId: string, replacement: boolean): string {
+  const task = store.getTask(taskId);
+  const workspace = store.getWorkspace(taskId);
+  if (!task || !workspace) throw new Error("task context is incomplete");
+  const latestReview = store.getLatestReview(taskId);
+  const findings = latestReview ? store.listFindings(latestReview.id) : [];
+  const sections = [
+    replacement ? "Resume this durable SwitchYard Task." : "Start this SwitchYard Task.",
+    `Task ID: ${task.id}`,
+    `Kind: ${task.kind}`,
+    `Instruction:\n${task.instruction}`,
+    `Workspace: ${workspace.path}`,
+    `Branch: ${workspace.branch}`,
+    `Base SHA: ${task.base_sha ?? "(not recorded)"}`,
+  ];
+  if (task.summary) sections.push(`Previous completion summary:\n${task.summary}`);
+  if (task.verification_summary) {
+    sections.push(`Previous verification summary:\n${task.verification_summary}`);
+  }
+  if (findings.length > 0) {
+    sections.push(
+      `Outstanding review findings:\n${findings
+        .map((finding, index) => `${index + 1}. ${finding.summary}: ${finding.required_change}`)
+        .join("\n")}`,
+    );
+  }
+  return sections.join("\n\n");
 }

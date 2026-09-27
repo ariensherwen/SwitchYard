@@ -4,11 +4,7 @@ import type { SwitchYardPaths } from "./home.ts";
 import { enqueueMessage } from "./inbox.ts";
 import type { ReviewPolicy, StateStore, TaskKind, TaskRecord, TaskState } from "./state.ts";
 import { now } from "./state.ts";
-import {
-  createWorkspace,
-  validateImplementCandidate,
-  validateInvestigateCompletion,
-} from "./worktree.ts";
+import { createWorkspace, validateImplementCandidate, validateInvestigateCompletion } from "./worktree.ts";
 
 const TERMINAL = new Set<TaskState>(["completed", "failed", "cancelled"]);
 const ALLOWED: Record<TaskState, readonly TaskState[]> = {
@@ -30,13 +26,11 @@ export function createTask(
   instruction: string,
   reviewPolicy: ReviewPolicy,
 ): TaskRecord {
-  if (reviewPolicy === "loop" && kind !== "implement")
-    throw new Error("review loop is supported only for implement tasks");
+  if (reviewPolicy === "loop" && kind !== "implement") throw new Error("review loop is supported only for implement tasks");
   const id = randomUUID();
   const timestamp = now();
   store.transaction(() => {
-    store.db
-      .prepare(`INSERT INTO tasks(id, project_id, kind, instruction, review_policy, state, created_at, updated_at)
+    store.db.prepare(`INSERT INTO tasks(id, project_id, kind, instruction, review_policy, state, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)`)
       .run(id, projectId, kind, instruction, reviewPolicy, timestamp, timestamp);
     store.event(id, "task.created", { kind, review: reviewPolicy });
@@ -44,11 +38,7 @@ export function createTask(
   return requiredTask(store, id);
 }
 
-export async function startTask(
-  store: StateStore,
-  paths: SwitchYardPaths,
-  taskId: string,
-): Promise<TaskRecord> {
+export async function startTask(store: StateStore, paths: SwitchYardPaths, taskId: string): Promise<TaskRecord> {
   const task = requiredTask(store, taskId);
   const project = store.getProject(task.project_id);
   if (!project) throw new Error(`project not found: ${task.project_id}`);
@@ -58,11 +48,9 @@ export async function startTask(
   try {
     const workspace = await createWorkspace(project.root_path, workspacePath, branch);
     store.transaction(() => {
-      store.db
-        .prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
+      store.db.prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
         .run(taskId, workspace.path, workspace.branch, now());
-      store.db
-        .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
+      store.db.prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
         .run(workspace.baseSha, now(), taskId);
     });
     return requiredTask(store, taskId);
@@ -88,18 +76,20 @@ export function resumeWaiting(store: StateStore, taskId: string, message?: strin
   return result;
 }
 
-export function requestDecision(
-  store: StateStore,
-  taskId: string,
-  question: string,
-  context?: string,
-  options?: string[],
-): string {
+
+export function steerTask(store: StateStore, taskId: string, message: string): TaskRecord {
+  const task = requiredTask(store, taskId);
+  if (TERMINAL.has(task.state)) throw new Error("cannot steer a terminal task");
+  if (task.state === "waiting") return resumeWaiting(store, taskId, message);
+  enqueueMessage(store, taskId, "worker", message);
+  return requiredTask(store, taskId);
+}
+
+export function requestDecision(store: StateStore, taskId: string, question: string, context?: string, options?: string[]): string {
   const id = randomUUID();
   store.transaction(() => {
     casTransition(store, taskId, "running", "needs_decision");
-    store.db
-      .prepare(`INSERT INTO decisions(id, task_id, question, context, options_json, state, created_at)
+    store.db.prepare(`INSERT INTO decisions(id, task_id, question, context, options_json, state, created_at)
       VALUES (?, ?, ?, ?, ?, 'open', ?)`)
       .run(id, taskId, question, context ?? null, options ? JSON.stringify(options) : null, now());
     store.event(taskId, "decision.requested", { id, question });
@@ -108,20 +98,11 @@ export function requestDecision(
   return id;
 }
 
-export function resolveDecision(
-  store: StateStore,
-  taskId: string,
-  decisionId: string,
-  answer: string,
-): TaskRecord {
+export function resolveDecision(store: StateStore, taskId: string, decisionId: string, answer: string): TaskRecord {
   store.transaction(() => {
     const decision = store.getDecision(decisionId);
-    if (!decision || decision.task_id !== taskId || decision.state !== "open")
-      throw new Error("open decision not found for task");
-    const changed = store.db
-      .prepare(
-        "UPDATE decisions SET state='resolved', answer=?, resolved_at=? WHERE id=? AND state='open'",
-      )
+    if (!decision || decision.task_id !== taskId || decision.state !== "open") throw new Error("open decision not found for task");
+    const changed = store.db.prepare("UPDATE decisions SET state='resolved', answer=?, resolved_at=? WHERE id=? AND state='open'")
       .run(answer, now(), decisionId);
     if (changed.changes !== 1) throw new Error("decision was already resolved");
     casTransition(store, taskId, "needs_decision", "running");
@@ -139,8 +120,7 @@ export async function submitCandidate(
   verificationSummary: string,
 ): Promise<{ task: TaskRecord; candidateSha: string | null }> {
   const task = requiredTask(store, taskId);
-  if (task.state !== "running")
-    throw new Error(`task ${taskId} is ${task.state}, expected running`);
+  if (task.state !== "running") throw new Error(`task ${taskId} is ${task.state}, expected running`);
   const workspace = store.getWorkspace(taskId);
   if (!workspace || !task.base_sha) throw new Error("task workspace/base revision is missing");
 
@@ -148,8 +128,7 @@ export async function submitCandidate(
     await validateInvestigateCompletion(workspace.path, task.base_sha);
     store.transaction(() => {
       casTransition(store, taskId, "running", "completed");
-      store.db
-        .prepare("UPDATE tasks SET summary=?, verification_summary=?, updated_at=? WHERE id=?")
+      store.db.prepare("UPDATE tasks SET summary=?, verification_summary=?, updated_at=? WHERE id=?")
         .run(summary, verificationSummary, now(), taskId);
       store.event(taskId, "task.completed", { summary });
       enqueueMessage(store, taskId, "supervisor", `Task ${taskId} completed: ${summary}`);
@@ -157,33 +136,18 @@ export async function submitCandidate(
     return { task: requiredTask(store, taskId), candidateSha: null };
   }
 
-  const candidateSha = await validateImplementCandidate(
-    workspace.path,
-    workspace.branch,
-    task.base_sha,
-  );
+  const candidateSha = await validateImplementCandidate(workspace.path, workspace.branch, task.base_sha);
   const previousReview = store.getLatestReview(taskId);
-  if (
-    previousReview?.state === "changes_requested" &&
-    previousReview.candidate_sha === candidateSha
-  ) {
+  if (previousReview?.state === "changes_requested" && previousReview.candidate_sha === candidateSha) {
     throw new Error("candidate SHA is unchanged after changes were requested");
   }
   store.transaction(() => {
-    store.db
-      .prepare(
-        "UPDATE tasks SET candidate_sha=?, summary=?, verification_summary=?, updated_at=? WHERE id=? AND state='running'",
-      )
+    store.db.prepare("UPDATE tasks SET candidate_sha=?, summary=?, verification_summary=?, updated_at=? WHERE id=? AND state='running'")
       .run(candidateSha, summary, verificationSummary, now(), taskId);
     if (task.review_policy === "loop") {
       casTransition(store, taskId, "running", "reviewing");
       store.event(taskId, "task.reviewing", { candidate_sha: candidateSha });
-      enqueueMessage(
-        store,
-        taskId,
-        "supervisor",
-        `Task ${taskId} entered review for ${candidateSha}`,
-      );
+      enqueueMessage(store, taskId, "supervisor", `Task ${taskId} entered review for ${candidateSha}`);
     } else {
       casTransition(store, taskId, "running", "completed");
       store.event(taskId, "task.completed", { candidate_sha: candidateSha, summary });
@@ -195,8 +159,7 @@ export async function submitCandidate(
 
 export function cancelTask(store: StateStore, taskId: string): TaskRecord {
   const task = requiredTask(store, taskId);
-  if (TERMINAL.has(task.state))
-    throw new Error(`task ${taskId} is already terminal: ${task.state}`);
+  if (TERMINAL.has(task.state)) throw new Error(`task ${taskId} is already terminal: ${task.state}`);
   store.transaction(() => {
     casTransition(store, taskId, task.state, "cancelled");
     store.event(taskId, "task.cancelled");
@@ -210,9 +173,7 @@ export function failTask(store: StateStore, taskId: string, failure: string): Ta
   if (TERMINAL.has(task.state)) return task;
   store.transaction(() => {
     casTransition(store, taskId, task.state, "failed");
-    store.db
-      .prepare("UPDATE tasks SET failure=?, updated_at=? WHERE id=?")
-      .run(failure, now(), taskId);
+    store.db.prepare("UPDATE tasks SET failure=?, updated_at=? WHERE id=?").run(failure, now(), taskId);
     store.event(taskId, "task.failed", { failure });
     enqueueMessage(store, taskId, "supervisor", `Task ${taskId} failed: ${failure}`);
   });
@@ -235,15 +196,9 @@ export function transition(
   return requiredTask(store, taskId);
 }
 
-export function casTransition(
-  store: StateStore,
-  taskId: string,
-  from: TaskState,
-  to: TaskState,
-): void {
+export function casTransition(store: StateStore, taskId: string, from: TaskState, to: TaskState): void {
   if (!ALLOWED[from].includes(to)) throw new Error(`illegal task transition ${from} -> ${to}`);
-  const result = store.db
-    .prepare("UPDATE tasks SET state=?, updated_at=? WHERE id=? AND state=?")
+  const result = store.db.prepare("UPDATE tasks SET state=?, updated_at=? WHERE id=? AND state=?")
     .run(to, now(), taskId, from);
   if (result.changes !== 1) {
     const current = store.getTask(taskId)?.state ?? "missing";

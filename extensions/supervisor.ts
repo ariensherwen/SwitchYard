@@ -1,10 +1,10 @@
 import { openSwitchYard } from "../src/context.ts";
-import { enqueueMessage, markDelivered } from "../src/inbox.ts";
+import { markDelivered, startWakePump } from "../src/inbox.ts";
 import { addProject } from "../src/projects.ts";
 import { reconcile } from "../src/reconcile.ts";
-import { startWorker, stopWorker, wakeWorker } from "../src/runtime.ts";
+import { quiesceTaskRuntimes, startWorker, wakeWorker } from "../src/runtime.ts";
 import type { MessageRecord, TaskKind } from "../src/state.ts";
-import { cancelTask, createTask, failTask, resolveDecision, startTask } from "../src/tasks.ts";
+import { cancelTask, createTask, failTask, resolveDecision, startTask, steerTask } from "../src/tasks.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
 import { booleanSchema, enumSchema, objectSchema, stringSchema } from "./schema.ts";
 
@@ -28,7 +28,18 @@ interface ResolveDecisionParams extends TaskParams {
   answer: string;
 }
 
+const SUPERVISOR_TOOLS = [
+  "switchyard_delegate",
+  "switchyard_list_tasks",
+  "switchyard_get_task",
+  "switchyard_send_message",
+  "switchyard_resolve_decision",
+  "switchyard_cancel_task",
+];
+
 export default function supervisorExtension(pi: PiExtensionApi) {
+  let stopWakePump: (() => void) | undefined;
+  let delivering = false;
   const result = (value: unknown) => ({
     content: [
       { type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) },
@@ -72,6 +83,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
               task.id,
               `worker startup failed: ${error instanceof Error ? error.message : String(error)}`,
             );
+            await quiesceTaskRuntimes(store, task.id);
           }
         }
         return result(store.getTask(task.id));
@@ -122,21 +134,14 @@ export default function supervisorExtension(pi: PiExtensionApi) {
   pi.registerTool({
     name: "switchyard_send_message",
     label: "Steer task",
-    description: "Persist a steering message for a nonterminal task and wake its Worker.",
-    parameters: objectSchema({ task_id: stringSchema(), text: stringSchema() }, [
-      "task_id",
-      "text",
-    ]),
+    description: "Persist steering for a nonterminal task and resume it when explicitly waiting.",
+    parameters: objectSchema({ task_id: stringSchema(), text: stringSchema() }, ["task_id", "text"]),
     async execute(_id: string, params: SendMessageParams) {
-      const { store } = await openSwitchYard();
+      const { paths, store } = await openSwitchYard();
       try {
-        const task = store.getTask(params.task_id);
-        if (!task || ["completed", "failed", "cancelled"].includes(task.state)) {
-          throw new Error("task is missing or terminal");
-        }
-        const messageId = enqueueMessage(store, task.id, "worker", params.text);
-        await wakeWorker(store, task.id);
-        return result({ message_id: messageId });
+        const task = steerTask(store, params.task_id, params.text);
+        await wakeWorker(store, paths, task.id);
+        return result(task);
       } finally {
         store.close();
       }
@@ -152,10 +157,10 @@ export default function supervisorExtension(pi: PiExtensionApi) {
       ["task_id", "decision_id", "answer"],
     ),
     async execute(_id: string, params: ResolveDecisionParams) {
-      const { store } = await openSwitchYard();
+      const { paths, store } = await openSwitchYard();
       try {
         const task = resolveDecision(store, params.task_id, params.decision_id, params.answer);
-        await wakeWorker(store, task.id);
+        await wakeWorker(store, paths, task.id);
         return result(task);
       } finally {
         store.close();
@@ -172,7 +177,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
       const { store } = await openSwitchYard();
       try {
         const task = cancelTask(store, params.task_id);
-        await stopWorker(store, task.id);
+        await quiesceTaskRuntimes(store, task.id);
         return result(task);
       } finally {
         store.close();
@@ -181,23 +186,52 @@ export default function supervisorExtension(pi: PiExtensionApi) {
   });
 
   async function deliverSupervisorMessages() {
-    const { paths, store } = await openSwitchYard();
+    if (delivering) return;
+    delivering = true;
     try {
-      await reconcile(store, paths);
-      const rows = store.db
-        .prepare(
-          "SELECT * FROM messages WHERE recipient='supervisor' AND state='pending' ORDER BY created_at, id",
-        )
-        .all() as unknown as MessageRecord[];
-      for (const message of rows) {
-        await pi.sendUserMessage(message.text, { deliverAs: "followUp" });
-        markDelivered(store, message.id);
+      const { paths, store } = await openSwitchYard();
+      try {
+        pi.setActiveTools(SUPERVISOR_TOOLS);
+        await reconcile(store, paths);
+        const rows = store.db
+          .prepare(
+            "SELECT * FROM messages WHERE recipient='supervisor' AND state='pending' ORDER BY created_at, id",
+          )
+          .all() as unknown as MessageRecord[];
+        if (rows.length === 0) return;
+        await pi.sendUserMessage(rows.map((row) => row.text).join("\n\n---\n\n"), {
+          deliverAs: "steer",
+        });
+        store.transaction(() => {
+          for (const message of rows) markDelivered(store, message.id);
+        });
+      } finally {
+        store.close();
       }
     } finally {
-      store.close();
+      delivering = false;
     }
   }
 
-  pi.on("session_start", deliverSupervisorMessages);
+  pi.on("tool_call", async (event) => {
+    const toolName = (event as { toolName?: string } | undefined)?.toolName;
+    if (!toolName || SUPERVISOR_TOOLS.includes(toolName)) return undefined;
+    return { block: true, reason: "Supervisor authority is limited to SwitchYard control tools." };
+  });
+
+  pi.on("session_start", async () => {
+    pi.setActiveTools(SUPERVISOR_TOOLS);
+    const { paths, store } = await openSwitchYard();
+    try {
+      stopWakePump ??= startWakePump(paths.wake, "supervisor.wake", deliverSupervisorMessages, 2000);
+    } finally {
+      store.close();
+    }
+    await deliverSupervisorMessages();
+  });
   pi.on("agent_end", deliverSupervisorMessages);
+  pi.on("session_shutdown", async () => {
+    stopWakePump?.();
+    stopWakePump = undefined;
+  });
 }

@@ -5,8 +5,9 @@ const execFileAsync = promisify(execFile);
 export const TMUX_SESSION = process.env.SWITCHYARD_TMUX_SESSION || "switchyard";
 
 export async function ensureSession(): Promise<void> {
-  if (!(await hasSession()))
-    await tmux(["new-session", "-d", "-s", TMUX_SESSION, "-n", "supervisor"]);
+  if (!(await hasSession())) {
+    await tmux(["new-session", "-d", "-s", TMUX_SESSION, "-n", "__switchyard", "sleep 2147483647"]);
+  }
 }
 
 export async function hasSession(): Promise<boolean> {
@@ -20,17 +21,36 @@ export async function hasSession(): Promise<boolean> {
 
 export async function windowAlive(window: string): Promise<boolean> {
   try {
-    await tmux(["display-message", "-p", "-t", `${TMUX_SESSION}:${window}`, "#{pane_dead}"]);
+    const { stdout } = await tmux([
+      "display-message",
+      "-p",
+      "-t",
+      `${TMUX_SESSION}:${window}`,
+      "#{pane_dead}",
+    ]);
+    return stdout.trim() === "0";
+  } catch {
+    return false;
+  }
+}
+
+async function windowExists(window: string): Promise<boolean> {
+  try {
+    await tmux(["display-message", "-p", "-t", `${TMUX_SESSION}:${window}`, "#{window_id}"]);
     return true;
   } catch {
     return false;
   }
 }
 
-export async function ensureWindow(window: string, cwd: string, command: string[]): Promise<void> {
-  await ensureSession();
+export async function ensureWindow(window: string, cwd: string, command: string): Promise<void> {
+  if (!(await hasSession())) {
+    await tmux(["new-session", "-d", "-s", TMUX_SESSION, "-n", window, "-c", cwd, command]);
+    return;
+  }
   if (await windowAlive(window)) return;
-  await tmux(["new-window", "-d", "-t", TMUX_SESSION, "-n", window, "-c", cwd, ...command]);
+  if (await windowExists(window)) await killWindow(window);
+  await tmux(["new-window", "-d", "-t", TMUX_SESSION, "-n", window, "-c", cwd, command]);
 }
 
 export async function killWindow(window: string): Promise<void> {
@@ -52,15 +72,6 @@ export async function attachWindow(window: string): Promise<number> {
     child.once("error", () => resolve(1));
     child.once("close", (code) => resolve(code ?? 1));
   });
-}
-
-export async function sendWake(window: string): Promise<void> {
-  // This is intentionally a wake signal only. Durable messages remain in SQLite.
-  try {
-    await tmux(["send-keys", "-t", `${TMUX_SESSION}:${window}`, "C-l"]);
-  } catch {
-    // Missing wake is harmless; reconciliation/durable polling will deliver later.
-  }
 }
 
 async function tmux(args: string[]): Promise<{ stdout: string; stderr: string }> {

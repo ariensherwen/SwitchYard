@@ -1,10 +1,10 @@
 import { openSwitchYard } from "../src/context.ts";
-import { markDelivered } from "../src/inbox.ts";
+import { markDelivered, startWakePump } from "../src/inbox.ts";
 import { beginReview } from "../src/review.ts";
-import { startReviewer, wakeSupervisor } from "../src/runtime.ts";
-import type { StateStore } from "../src/state.ts";
+import { retireWorker, startReviewer, wakeSupervisor } from "../src/runtime.ts";
+import type { StateStore, TaskState } from "../src/state.ts";
 import { markWaiting, requestDecision, submitCandidate } from "../src/tasks.ts";
-import type { PiExtensionApi } from "./pi-types.ts";
+import type { PiExtensionApi, PiExtensionContext } from "./pi-types.ts";
 import { objectSchema, stringArraySchema, stringSchema } from "./schema.ts";
 
 interface CompleteParams {
@@ -22,9 +22,22 @@ interface WaitParams {
   reason: string;
 }
 
+const WORKER_TOOLS = [
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "switchyard_complete",
+  "switchyard_request_decision",
+  "switchyard_wait",
+];
+
 export default function workerExtension(pi: PiExtensionApi) {
   const taskId = requiredEnv("SWITCHYARD_TASK_ID");
   const workerId = requiredEnv("SWITCHYARD_WORKER_ID");
+  let stopWakePump: (() => void) | undefined;
+  let delivering = false;
+
   const result = (value: unknown) => ({
     content: [
       { type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) },
@@ -40,7 +53,7 @@ export default function workerExtension(pi: PiExtensionApi) {
       "summary",
       "verification_summary",
     ]),
-    async execute(_id: string, params: CompleteParams) {
+    async execute(_id: string, params: CompleteParams, _signal, _onUpdate, ctx) {
       const { paths, store } = await openSwitchYard();
       try {
         assertActiveWorker(store);
@@ -51,16 +64,20 @@ export default function workerExtension(pi: PiExtensionApi) {
           params.verification_summary,
         );
         if (submitted.task.state === "reviewing") {
+          setToolsForState(pi, "reviewing");
           const reviewId = await beginReview(store, paths, taskId);
           await startReviewer(store, paths, reviewId);
-          await wakeSupervisor();
+          await wakeSupervisor(paths);
           return result({
             state: "reviewing",
             candidate_sha: submitted.candidateSha,
             review_id: reviewId,
           });
         }
-        await wakeSupervisor();
+        retireWorker(store, taskId, workerId, "task reached terminal completion");
+        pi.setActiveTools([]);
+        await wakeSupervisor(paths);
+        ctx?.shutdown();
         return result(submitted.task);
       } finally {
         store.close();
@@ -77,7 +94,7 @@ export default function workerExtension(pi: PiExtensionApi) {
       ["question"],
     ),
     async execute(_id: string, params: DecisionParams) {
-      const { store } = await openSwitchYard();
+      const { paths, store } = await openSwitchYard();
       try {
         assertActiveWorker(store);
         const decisionId = requestDecision(
@@ -87,7 +104,8 @@ export default function workerExtension(pi: PiExtensionApi) {
           params.context,
           params.options,
         );
-        await wakeSupervisor();
+        setToolsForState(pi, "needs_decision");
+        await wakeSupervisor(paths);
         return result({ decision_id: decisionId });
       } finally {
         store.close();
@@ -98,15 +116,15 @@ export default function workerExtension(pi: PiExtensionApi) {
   pi.registerTool({
     name: "switchyard_wait",
     label: "Wait",
-    description:
-      "Explicitly mark this Task waiting for external input or a later steering message.",
+    description: "Explicitly mark this Task waiting for external input or a later steering message.",
     parameters: objectSchema({ reason: stringSchema() }, ["reason"]),
     async execute(_id: string, params: WaitParams) {
-      const { store } = await openSwitchYard();
+      const { paths, store } = await openSwitchYard();
       try {
         assertActiveWorker(store);
         const task = markWaiting(store, taskId, params.reason);
-        await wakeSupervisor();
+        setToolsForState(pi, task.state);
+        await wakeSupervisor(paths);
         return result(task);
       } finally {
         store.close();
@@ -115,34 +133,72 @@ export default function workerExtension(pi: PiExtensionApi) {
   });
 
   async function deliverPending() {
-    const { store } = await openSwitchYard();
+    if (delivering) return;
+    delivering = true;
     try {
-      if (store.getActiveWorker(taskId)?.id !== workerId) return;
-      for (const message of store.listPendingMessages(taskId, "worker")) {
-        await pi.sendUserMessage(message.text, { deliverAs: "followUp" });
-        markDelivered(store, message.id);
+      const { store } = await openSwitchYard();
+      try {
+        if (store.getActiveWorker(taskId)?.id !== workerId) {
+          pi.setActiveTools([]);
+          return;
+        }
+        const task = store.getTask(taskId);
+        if (!task) return;
+        setToolsForState(pi, task.state);
+        if (task.state !== "running") return;
+        const messages = store.listPendingMessages(taskId, "worker");
+        if (messages.length === 0) return;
+        const payload = messages.map((message) => message.text).join("\n\n---\n\n");
+        await pi.sendUserMessage(payload, { deliverAs: "steer" });
+        store.transaction(() => {
+          for (const message of messages) markDelivered(store, message.id);
+        });
+      } finally {
+        store.close();
       }
     } finally {
-      store.close();
+      delivering = false;
     }
   }
 
+  pi.on("tool_call", async (event) => {
+    const toolName = (event as { toolName?: string } | undefined)?.toolName;
+    if (!toolName || !["read", "bash", "edit", "write"].includes(toolName)) return undefined;
+    const { store } = await openSwitchYard();
+    try {
+      const task = store.getTask(taskId);
+      if (task?.state === "running" && store.getActiveWorker(taskId)?.id === workerId) return undefined;
+      return { block: true, reason: `Task ${taskId} is not running; Worker mutation authority is suspended.` };
+    } finally {
+      store.close();
+    }
+  });
+
   pi.on("session_start", async () => {
-    await record("worker.session_started");
+    const { paths, store } = await openSwitchYard();
+    try {
+      const task = store.getTask(taskId);
+      setToolsForState(pi, task?.state ?? "failed");
+      store.event(taskId, "worker.session_started", { worker_id: workerId });
+      stopWakePump ??= startWakePump(paths.wake, `worker-${workerId}.wake`, deliverPending);
+    } finally {
+      store.close();
+    }
     await deliverPending();
   });
   pi.on("turn_start", async () => {
     await record("worker.turn_started");
-    await deliverPending();
   });
   pi.on("turn_end", async () => {
     await record("worker.turn_finished");
   });
-  pi.on("agent_settled", async () => {
+  pi.on("agent_end", async () => {
     await record("worker.settled");
     await deliverPending();
   });
   pi.on("session_shutdown", async () => {
+    stopWakePump?.();
+    stopWakePump = undefined;
     await record("worker.session_shutdown");
   });
 
@@ -160,6 +216,10 @@ export default function workerExtension(pi: PiExtensionApi) {
       throw new Error("this Pi session is not the active Worker for the Task");
     }
   }
+}
+
+function setToolsForState(pi: PiExtensionApi, state: TaskState): void {
+  pi.setActiveTools(state === "running" ? WORKER_TOOLS : []);
 }
 
 function requiredEnv(name: string): string {

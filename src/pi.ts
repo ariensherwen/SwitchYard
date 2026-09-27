@@ -18,7 +18,7 @@ export function buildPiLaunch(
   prompt?: string,
 ): PiLaunch {
   const extension = path.join(PACKAGE_ROOT, "extensions", `${role}.ts`);
-  const args = ["pi", "-e", extension];
+  const args = ["pi", "--no-extensions", "-e", extension];
   if (prompt) args.push("--append-system-prompt", prompt);
   return {
     cwd,
@@ -31,12 +31,17 @@ export function buildPiLaunch(
   };
 }
 
-export function shellCommand(launch: PiLaunch): string[] {
-  return [
+export function shellCommand(launch: PiLaunch): string {
+  const argv = [
     "env",
     ...Object.entries(launch.env)
       .filter(([key, value]) => key.startsWith("SWITCHYARD_") && value !== undefined)
       .map(([key, value]) => `${key}=${value}`),
     ...launch.command,
   ];
+  return argv.map(shellQuote).join(" ");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }

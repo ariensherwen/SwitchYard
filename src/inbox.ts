@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { watch, type FSWatcher } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { StateStore } from "./state.ts";
@@ -30,4 +31,26 @@ export function markDelivered(store: StateStore, messageId: string): void {
 
 export async function signalWake(wakeDir: string, target: string): Promise<void> {
   await writeFile(path.join(wakeDir, target), `${Date.now()}\n`, "utf8");
+}
+
+export function startWakePump(
+  wakeDir: string,
+  target: string,
+  callback: () => void | Promise<void>,
+  intervalMs = 1000,
+): () => void {
+  let watcher: FSWatcher | undefined;
+  try {
+    watcher = watch(wakeDir, (_event, filename) => {
+      if (filename === target) void callback();
+    });
+  } catch {
+    // Polling below is the durability fallback when fs.watch is unavailable.
+  }
+  const timer = setInterval(() => void callback(), intervalMs);
+  timer.unref();
+  return () => {
+    watcher?.close();
+    clearInterval(timer);
+  };
 }
