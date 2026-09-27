@@ -196,7 +196,7 @@ export async function canSafelyClean(
   workspace: string,
   baseSha: string,
 ): Promise<boolean> {
-  const status = (await git(workspace, ["status", "--porcelain"])).stdout.trim();
+  const status = (await git(workspace, ["status", "--porcelain", "--ignored"])).stdout.trim();
   if (status) return false;
   const head = await currentHead(workspace);
   if (head === baseSha) return true;

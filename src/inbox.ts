@@ -40,14 +40,25 @@ export function startWakePump(
   intervalMs = 1000,
 ): () => void {
   let watcher: FSWatcher | undefined;
+  let callbackInFlight = false;
+  const runCallback = () => {
+    if (callbackInFlight) return;
+    callbackInFlight = true;
+    void Promise.resolve()
+      .then(callback)
+      .catch(() => undefined)
+      .finally(() => {
+        callbackInFlight = false;
+      });
+  };
   try {
     watcher = watch(wakeDir, (_event, filename) => {
-      if (filename === target) void callback();
+      if (filename === target) runCallback();
     });
   } catch {
     // Polling below is the durability fallback when fs.watch is unavailable.
   }
-  const timer = setInterval(() => void callback(), intervalMs);
+  const timer = setInterval(runCallback, intervalMs);
   timer.unref();
   return () => {
     watcher?.close();

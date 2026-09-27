@@ -42,16 +42,23 @@ export async function startWorker(
   }
 }
 
+export interface WorkerReplacementHooks {
+  afterTaskCheck?: () => void | Promise<void>;
+  afterReservation?: () => void | Promise<void>;
+}
+
 export async function replaceWorker(
   store: StateStore,
   paths: SwitchYardPaths,
   taskId: string,
+  hooks: WorkerReplacementHooks = {},
 ): Promise<string> {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
   if (task?.state !== "running" || !workspace) {
     throw new Error("task is not ready for a replacement Worker");
   }
+  await hooks.afterTaskCheck?.();
 
   const live = store.getLiveWorker(taskId);
   if (live?.state === "starting") {
@@ -72,6 +79,7 @@ export async function replaceWorker(
 
   const worker = reserveWorker(store, taskId, true);
   try {
+    await hooks.afterReservation?.();
     await launchReservedWorker(store, paths, worker);
     activateReservedWorker(store, taskId, worker.id);
     return worker.id;
@@ -97,10 +105,15 @@ export async function resumeReservedWorker(
 }
 
 function reserveWorker(store: StateStore, taskId: string, replacement: boolean): WorkerRecord {
-  if (store.getLiveWorker(taskId)) throw new Error("task already has a live Worker identity");
   const workerId = randomUUID();
   const window = `task-${taskId}`;
   store.transaction(() => {
+    const task = store.getTask(taskId);
+    const expectedState = replacement ? "running" : "starting";
+    if (task?.state !== expectedState) {
+      throw new Error(`task ${taskId} is ${task?.state ?? "missing"}, expected ${expectedState}`);
+    }
+    if (store.getLiveWorker(taskId)) throw new Error("task already has a live Worker identity");
     store.db
       .prepare(
         `INSERT INTO workers(id, task_id, state, tmux_window, created_at)
@@ -157,6 +170,12 @@ function activateWorkerAndTask(store: StateStore, taskId: string, workerId: stri
 
 function activateReservedWorker(store: StateStore, taskId: string, workerId: string): void {
   store.transaction(() => {
+    const task = store.getTask(taskId);
+    if (task?.state !== "running") {
+      throw new Error(
+        `cannot activate replacement Worker while task is ${task?.state ?? "missing"}`,
+      );
+    }
     const changed = store.db
       .prepare("UPDATE workers SET state='active' WHERE id=? AND task_id=? AND state='starting'")
       .run(workerId, taskId);

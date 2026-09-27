@@ -12,6 +12,7 @@ import { enqueueMessage } from "../src/inbox.ts";
 import { beginReview } from "../src/review.ts";
 import {
   quiesceTaskRuntimes,
+  replaceWorker,
   resumeReservedWorker,
   startReviewer,
   startWorker,
@@ -91,6 +92,50 @@ test("transient investigation uses a cloned source without registering a Project
   assert.equal(workspace?.provisioned, 1);
   assert.ok(workspace?.path.startsWith(path.join(paths.worktrees, "transient")));
   assert.ok(stored?.source_path && existsSync(stored.source_path));
+  store.close();
+});
+
+test("replacement reservation cannot cross cancellation on another StateStore connection", async () => {
+  const { paths, store } = await fixture();
+  const task = createTask(store, "p", "implement", "cancel before replacement reservation", "off");
+  await startTask(store, paths, task.id);
+  markRunning(store, task.id);
+  const cancellingStore = new StateStore(paths.database);
+
+  await assert.rejects(
+    replaceWorker(store, paths, task.id, {
+      afterTaskCheck: () => cancelTask(cancellingStore, task.id),
+    }),
+    /expected running/,
+  );
+  assert.equal(store.getTask(task.id)?.state, "cancelled");
+  assert.equal(store.getLiveWorker(task.id), undefined);
+  assert.equal(store.listWorkers(task.id).length, 0);
+  cancellingStore.close();
+  store.close();
+});
+
+test("replacement activation cannot cross cancellation on another StateStore connection", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "cancel before replacement activation", "off");
+  await startTask(store, paths, task.id);
+  markRunning(store, task.id);
+  const cancellingStore = new StateStore(paths.database);
+
+  await assert.rejects(
+    replaceWorker(store, paths, task.id, {
+      afterReservation: async () => {
+        cancelTask(cancellingStore, task.id);
+        await quiesceTaskRuntimes(cancellingStore, task.id);
+      },
+    }),
+    /cannot activate replacement Worker while task is cancelled/,
+  );
+  assert.equal(store.getTask(task.id)?.state, "cancelled");
+  assert.equal(store.getLiveWorker(task.id), undefined);
+  assert.equal(store.listWorkers(task.id)[0]?.state, "stopped");
+  assert.equal((await readFile(stateFile, "utf8")).trim(), "");
+  cancellingStore.close();
   store.close();
 });
 

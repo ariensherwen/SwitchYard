@@ -68,6 +68,25 @@ test("dirty registered project is rejected before worktree creation", async () =
   );
 });
 
+test("cleanup refuses ignored Workspace files and preserves them", async () => {
+  const root = await repo();
+  await writeFile(path.join(root, ".gitignore"), "ignored.txt\n");
+  await exec("git", ["add", ".gitignore"], { cwd: root });
+  await exec("git", ["commit", "-m", "ignore workspace output"], { cwd: root });
+  const workspace = `${root}-ignored-worktree`;
+  dirs.push(workspace);
+  const info = await createWorkspace(root, workspace, "switchyard/task-ignored");
+  const ignoredFile = path.join(workspace, "ignored.txt");
+  await writeFile(ignoredFile, "valuable ignored work\n");
+  await exec("git", ["check-ignore", "-q", "ignored.txt"], { cwd: workspace });
+
+  const safeToClean = await canSafelyClean(root, workspace, info.baseSha);
+  assert.equal(safeToClean, false);
+  if (safeToClean) await removeWorktree(root, workspace);
+  await access(ignoredFile);
+  await access(workspace);
+});
+
 test("cleanup refuses dirty worktree and failed Git removal preserves files", async () => {
   const root = await repo();
   const workspace = `${root}-dirty-worktree`;
