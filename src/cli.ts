@@ -2,7 +2,7 @@
 
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
-import { runDoctor, type DoctorReport } from "./doctor.js";
+import { type DoctorReport, runDoctor } from "./doctor.js";
 
 const HELP = `SwitchYard
 

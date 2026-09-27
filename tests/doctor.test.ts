@@ -121,8 +121,7 @@ async function fakePath(
         return;
       }
 
-      const { output, exitCode } =
-        typeof fake === "string" ? { output: fake, exitCode: 0 } : fake;
+      const { output, exitCode } = typeof fake === "string" ? { output: fake, exitCode: 0 } : fake;
       const executable = path.join(directory, name);
       await writeFile(
         executable,

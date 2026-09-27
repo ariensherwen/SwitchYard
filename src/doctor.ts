@@ -55,9 +55,7 @@ const TOOL_SPECS: ToolSpec[] = [
   },
 ];
 
-export async function runDoctor(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<DoctorReport> {
+export async function runDoctor(env: NodeJS.ProcessEnv = process.env): Promise<DoctorReport> {
   const checks = await Promise.all(TOOL_SPECS.map((spec) => checkTool(spec, env)));
   return {
     ok: checks.every((check) => check.ok),
@@ -65,10 +63,7 @@ export async function runDoctor(
   };
 }
 
-async function checkTool(
-  spec: ToolSpec,
-  env: NodeJS.ProcessEnv,
-): Promise<DoctorCheck> {
+async function checkTool(spec: ToolSpec, env: NodeJS.ProcessEnv): Promise<DoctorCheck> {
   try {
     const { stdout, stderr } = await execFileAsync(spec.command, spec.args, {
       env,

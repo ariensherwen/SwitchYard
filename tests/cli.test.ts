@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliPath = path.join(projectRoot, "src", "cli.ts");
