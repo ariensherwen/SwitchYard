@@ -1,0 +1,25 @@
+{
+  "name": "@prightcord/switchyard",
+  "version": "0.1.0",
+  "description": "A local control plane for running and supervising Pi coding workers in tmux with isolated Git worktrees and durable task state.",
+  "type": "module",
+  "bin": {
+    "switchyard": "./bin/switchyard.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "tsx --test tests/**/*.test.ts",
+    "check": "npm run lint && npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.13",
+    "@types/node": "22.20.4",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3"
+  }
+}
