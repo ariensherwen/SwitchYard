@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage } from "../src/inbox.ts";
@@ -14,14 +15,20 @@ import {
   resumeReservedWorker,
   startReviewer,
   startWorker,
+  wakeWorker,
 } from "../src/runtime.ts";
 import { now, StateStore } from "../src/state.ts";
 import {
   cancelTask,
   createTask,
+  createTransientInvestigation,
   failTask,
   markRunning,
+  markWaiting,
+  requestDecision,
+  resolveDecision,
   startTask,
+  steerTask,
   submitCandidate,
 } from "../src/tasks.ts";
 import { windowAlive } from "../src/tmux.ts";
@@ -67,6 +74,76 @@ async function fixture() {
   process.env.PATH = `${bin}:${originalPath}`;
   return { paths, store, stateFile, failureFile };
 }
+
+test("transient investigation uses a cloned source without registering a Project", async () => {
+  const { paths, store } = await fixture();
+  const sourceUrl = pathToFileURL(path.join(path.dirname(paths.home), "repo")).href;
+  const task = createTransientInvestigation(store, paths, sourceUrl, "Inspect the remote source");
+
+  await startTask(store, paths, task.id);
+
+  const stored = store.getTask(task.id);
+  const workspace = store.getWorkspace(task.id);
+  assert.equal(stored?.project_id, null);
+  assert.equal(stored?.source_url, sourceUrl);
+  assert.equal(stored?.kind, "investigate");
+  assert.equal(store.listProjects().length, 1);
+  assert.equal(workspace?.provisioned, 1);
+  assert.ok(workspace?.path.startsWith(path.join(paths.worktrees, "transient")));
+  assert.ok(stored?.source_path && existsSync(stored.source_path));
+  store.close();
+});
+
+test("resuming a waiting Task replaces its dead Worker before returning", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "resume after worker death", "off");
+  await startTask(store, paths, task.id);
+  const originalWorkerId = await startWorker(store, paths, task.id);
+  markWaiting(store, task.id, "waiting for guidance");
+  await rm(stateFile, { force: true });
+
+  steerTask(store, task.id, "Continue now");
+  await wakeWorker(store, paths, task.id);
+
+  const replacement = store.getActiveWorker(task.id);
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.ok(replacement);
+  assert.notEqual(replacement.id, originalWorkerId);
+  assert.equal(
+    store.listWorkers(task.id).find((worker) => worker.id === originalWorkerId)?.state,
+    "stopped",
+  );
+  assert.ok(
+    store
+      .listPendingMessages(task.id, "worker")
+      .some((message) => /Continue now/.test(message.text)),
+  );
+  store.close();
+});
+
+test("answering a Decision replaces its dead Worker before returning", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "resume after answer", "off");
+  await startTask(store, paths, task.id);
+  const originalWorkerId = await startWorker(store, paths, task.id);
+  const decisionId = requestDecision(store, task.id, "Choose?", undefined, ["a", "b"]);
+  await rm(stateFile, { force: true });
+
+  resolveDecision(store, task.id, decisionId, "a");
+  await wakeWorker(store, paths, task.id);
+
+  const replacement = store.getActiveWorker(task.id);
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.equal(store.getDecision(decisionId)?.state, "resolved");
+  assert.ok(replacement);
+  assert.notEqual(replacement.id, originalWorkerId);
+  assert.ok(
+    store
+      .listPendingMessages(task.id, "worker")
+      .some((message) => /answered: a/.test(message.text)),
+  );
+  store.close();
+});
 
 test("recovery starts a Task left queued by a crash after creation", async () => {
   const { paths, store } = await fixture();

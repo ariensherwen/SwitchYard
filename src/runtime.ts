@@ -5,7 +5,7 @@ import { enqueueMessage, signalWake } from "./inbox.ts";
 import { buildPiLaunch, shellCommand } from "./pi.ts";
 import type { StateStore, WorkerRecord } from "./state.ts";
 import { now } from "./state.ts";
-import { casTransition, terminateActiveReviews } from "./tasks.ts";
+import { casTransition, taskSourceRoot, terminateActiveReviews } from "./tasks.ts";
 import { ensureWindow, killWindow, windowAlive } from "./tmux.ts";
 import { changedPaths, diffText, removeWorktree } from "./worktree.ts";
 
@@ -228,10 +228,9 @@ export async function cleanupFinishedReviewRuntime(
   await killWindow(review.tmux_window);
   if (!existsSync(review.path)) return;
   const task = store.getTask(review.task_id);
-  const project = task ? store.getProject(task.project_id) : undefined;
-  if (!project) return;
+  if (!task) return;
   try {
-    await removeWorktree(project.root_path, review.path);
+    await removeWorktree(taskSourceRoot(store, task), review.path);
     store.event(review.task_id, "review.runtime_cleaned", { review_id: review.id });
   } catch (error) {
     store.event(review.task_id, "review.cleanup_failed", {
@@ -250,8 +249,15 @@ export async function wakeWorker(
   paths: SwitchYardPaths,
   taskId: string,
 ): Promise<void> {
-  const worker = store.getActiveWorker(taskId);
-  if (worker) await signalWake(paths.wake, `worker-${worker.id}.wake`);
+  if (store.getTask(taskId)?.state !== "running") return;
+  const worker = store.getLiveWorker(taskId);
+  if (worker?.state === "starting") {
+    await resumeReservedWorker(store, paths, worker);
+  } else if (!worker || !(await windowAlive(worker.tmux_window))) {
+    await replaceWorker(store, paths, taskId);
+  }
+  const activeWorker = store.getActiveWorker(taskId);
+  if (activeWorker) await signalWake(paths.wake, `worker-${activeWorker.id}.wake`);
 }
 
 export async function startReviewer(

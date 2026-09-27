@@ -10,7 +10,7 @@ import {
   startWorker,
 } from "./runtime.ts";
 import type { StateStore, TaskRecord, TaskState } from "./state.ts";
-import { failTask, startTask, terminateActiveReviews } from "./tasks.ts";
+import { completeRecoveredReview, failTask, startTask, terminateActiveReviews } from "./tasks.ts";
 import { windowAlive } from "./tmux.ts";
 
 const TERMINAL = new Set<TaskState>(["completed", "failed", "cancelled"]);
@@ -103,19 +103,11 @@ async function reconcileTask(
 
   const latest = latestReview;
   if (latest?.state === "clean" && latest.candidate_sha === task.candidate_sha) {
-    store.transaction(() => {
-      const changed = store.db
-        .prepare(
-          "UPDATE tasks SET state='completed', updated_at=? WHERE id=? AND state='reviewing' AND candidate_sha=?",
-        )
-        .run(new Date().toISOString(), task.id, latest.candidate_sha);
-      if (changed.changes === 1) {
-        terminateActiveReviews(store, task.id, "completed");
-        store.event(task.id, "task.completed", { recovered_review_id: latest.id });
-      }
-    });
-    await quiesceTaskRuntimes(store, task.id);
-    await cleanupFinishedReviewRuntime(store, latest.id);
+    const completed = completeRecoveredReview(store, task.id, latest.candidate_sha, latest.id);
+    if (completed) {
+      await quiesceTaskRuntimes(store, task.id);
+      await cleanupFinishedReviewRuntime(store, latest.id);
+    }
   } else if (latest?.state !== "running" || latest.startup_reserved) {
     await beginAndStartReview(store, paths, task.id);
   } else if (!(await windowAlive(latest.tmux_window))) {

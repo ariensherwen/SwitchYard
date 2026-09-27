@@ -136,12 +136,11 @@ grep -qx 'live-e2e' "$basic_workspace/README.md" || fail
 assert_runtime_quiesced "task-$basic_task"
 
 echo "2/5 idle steering + crash recovery with durable replacement context"
-resume_task="$("${CLI[@]}" task create "$project_id" --kind implement 'On your first Worker turn, call switchyard_wait with reason awaiting-guidance before modifying files. After the Task resumes, follow the latest Worker message and do not wait again.')" || fail
+resume_task="$("${CLI[@]}" task create "$project_id" --kind implement --no-review 'On your first Worker turn, call switchyard_wait with reason awaiting-guidance before modifying files. After the Task resumes, follow the latest Worker message and do not wait again.')" || fail
 wait_state "$resume_task" waiting
 old_worker="$(json_field "$resume_task" 'x.events.filter(e=>e.type==="worker.started").at(-1) && JSON.parse(x.events.filter(e=>e.type==="worker.started").at(-1).payload_json).worker_id')"
 tmux kill-window -t "$SWITCHYARD_TMUX_SESSION:task-$resume_task" || fail
 "${CLI[@]}" task send "$resume_task" 'Create steering.txt containing steered, commit it, verify clean status, then call switchyard_complete.' || fail
-run_reconcile || fail
 new_worker="$(json_field "$resume_task" 'x.events.filter(e=>e.type==="worker.started").at(-1) && JSON.parse(x.events.filter(e=>e.type==="worker.started").at(-1).payload_json).worker_id')"
 [[ -n "$old_worker" && -n "$new_worker" && "$old_worker" != "$new_worker" ]] || fail
 wait_state "$resume_task" completed
@@ -149,7 +148,7 @@ resume_workspace="$(json_field "$resume_task" 'x.workspace.path')"
 grep -qx 'steered' "$resume_workspace/steering.txt" || fail
 
 echo "3/5 durable Decision answer wakes idle Worker"
-decision_task="$("${CLI[@]}" task create "$project_id" --kind implement 'Immediately request a SwitchYard decision asking Which value? with options alpha and beta. After the answer arrives, create decision.txt containing the chosen value, commit it, verify clean status, then call switchyard_complete.')" || fail
+decision_task="$("${CLI[@]}" task create "$project_id" --kind implement --no-review 'Immediately request a SwitchYard decision asking Which value? with options alpha and beta. After the answer arrives, create decision.txt containing the chosen value, commit it, verify clean status, then call switchyard_complete.')" || fail
 wait_state "$decision_task" needs_decision
 decision_id="$(json_field "$decision_task" 'x.decision.id')"
 [[ -n "$decision_id" ]] || fail
@@ -159,7 +158,7 @@ decision_workspace="$(json_field "$decision_task" 'x.workspace.path')"
 grep -qx 'alpha' "$decision_workspace/decision.txt" || fail
 
 echo "4/5 real review loop reaches completed"
-review_task="$("${CLI[@]}" task create "$project_id" --kind implement --review 'Create review.txt containing review-live, commit it, verify git status is clean, then call switchyard_complete. If review findings arrive, fix all findings, commit a new candidate, and call switchyard_complete again.')" || fail
+review_task="$("${CLI[@]}" task create "$project_id" --kind implement 'Create review.txt containing review-live, commit it, verify git status is clean, then call switchyard_complete. If review findings arrive, fix all findings, commit a new candidate, and call switchyard_complete again.')" || fail
 wait_state "$review_task" completed 300
 review_json="$(task_json "$review_task")"
 grep -q '"state": "clean"' <<<"$review_json" || fail
@@ -168,7 +167,7 @@ review_window="$(json_field "$review_task" 'x.review.tmux_window')"
 [[ -n "$review_window" ]] && assert_runtime_quiesced "$review_window"
 
 echo "5/5 cancellation preserves committed work and cleanup refuses unlanded branch"
-cancel_task="$("${CLI[@]}" task create "$project_id" --kind implement 'Create cancel.txt containing preserve-me, commit it, then call switchyard_wait with reason ready-for-cancel. Do not call switchyard_complete.')" || fail
+cancel_task="$("${CLI[@]}" task create "$project_id" --kind implement --no-review 'Create cancel.txt containing preserve-me, commit it, then call switchyard_wait with reason ready-for-cancel. Do not call switchyard_complete.')" || fail
 wait_state "$cancel_task" waiting
 cancel_workspace="$(json_field "$cancel_task" 'x.workspace.path')"
 git -C "$cancel_workspace" log -1 --format=%B | grep -q . || fail

@@ -25,7 +25,10 @@ export interface ProjectRecord {
 
 export interface TaskRecord {
   id: string;
-  project_id: string;
+  project_id: string | null;
+  source_path: string | null;
+  source_url: string | null;
+  title: string;
   kind: TaskKind;
   instruction: string;
   review_policy: ReviewPolicy;
@@ -72,7 +75,7 @@ export interface DecisionRecord {
   question: string;
   context: string | null;
   options_json: string | null;
-  state: "open" | "resolved";
+  state: "open" | "resolved" | "cancelled";
   answer: string | null;
   created_at: string;
   resolved_at: string | null;
@@ -112,7 +115,7 @@ export interface EventRecord {
   created_at: string;
 }
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -437,6 +440,73 @@ export class StateStore {
         for (const project of projects) updateName.run(basename(project.root_path), project.id);
       }
     });
+
+    if (row.user_version <= 3) {
+      this.db.exec("PRAGMA foreign_keys=OFF");
+      try {
+        this.transaction(() => {
+          this.db.exec(`
+            CREATE TABLE tasks_new (
+              id TEXT PRIMARY KEY,
+              project_id TEXT REFERENCES projects(id),
+              source_path TEXT,
+              source_url TEXT,
+              title TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK(kind IN ('implement','investigate')),
+              instruction TEXT NOT NULL,
+              review_policy TEXT NOT NULL CHECK(review_policy IN ('off','loop')),
+              state TEXT NOT NULL CHECK(state IN ('queued','starting','running','waiting','needs_decision','reviewing','completed','failed','cancelled')),
+              base_sha TEXT,
+              candidate_sha TEXT,
+              summary TEXT,
+              verification_summary TEXT,
+              failure TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              CHECK (
+                (project_id IS NOT NULL AND source_path IS NULL AND source_url IS NULL)
+                OR (project_id IS NULL AND source_path IS NOT NULL AND source_url IS NOT NULL
+                  AND kind='investigate' AND review_policy='off')
+              )
+            );
+            INSERT INTO tasks_new(
+              id, project_id, source_path, source_url, title, kind, instruction, review_policy,
+              state, base_sha, candidate_sha, summary, verification_summary, failure, created_at,
+              updated_at
+            )
+            SELECT id, project_id, NULL, NULL, instruction, kind, instruction, review_policy,
+              state, base_sha, candidate_sha, summary, verification_summary, failure, created_at,
+              updated_at FROM tasks;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_new RENAME TO tasks;
+
+            CREATE TABLE decisions_new (
+              id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL REFERENCES tasks(id),
+              question TEXT NOT NULL,
+              context TEXT,
+              options_json TEXT,
+              state TEXT NOT NULL CHECK(state IN ('open','resolved','cancelled')),
+              answer TEXT,
+              created_at TEXT NOT NULL,
+              resolved_at TEXT
+            );
+            INSERT INTO decisions_new(
+              id, task_id, question, context, options_json, state, answer, created_at, resolved_at
+            ) SELECT id, task_id, question, context, options_json, state, answer, created_at,
+              resolved_at FROM decisions;
+            DROP TABLE decisions;
+            ALTER TABLE decisions_new RENAME TO decisions;
+            CREATE UNIQUE INDEX one_open_decision_per_task ON decisions(task_id) WHERE state='open';
+            PRAGMA user_version = 4;
+          `);
+        });
+      } finally {
+        this.db.exec("PRAGMA foreign_keys=ON");
+      }
+      const violations = this.db.prepare("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) throw new Error("schema migration left foreign key violations");
+    }
   }
 }
 

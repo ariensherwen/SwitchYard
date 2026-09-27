@@ -8,8 +8,10 @@ import type { MessageRecord, ProjectRecord, TaskKind, TaskRecord } from "../src/
 import {
   cancelTask,
   createTask,
+  createTransientInvestigation,
   failTask,
   resolveDecision,
+  reviewPolicyForTask,
   startTask,
   steerTask,
 } from "../src/tasks.ts";
@@ -20,7 +22,7 @@ interface DelegateParams {
   project: string;
   kind: TaskKind;
   instruction: string;
-  review: boolean;
+  review?: boolean;
   project_name?: string;
   project_location?: string;
   remote_action?: "clone" | "review_only";
@@ -69,7 +71,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     name: "switchyard_delegate",
     label: "Delegate task",
     description:
-      "Delegate by a registered Project name. Unknown projects enter explicit intake; never treat an unknown name or URL as a filesystem path.",
+      "Delegate by a registered Project name. Review is enabled by default for implementation Tasks; investigation Tasks are not reviewed. Unknown remote URLs require explicit clone or review-only intake.",
     parameters: objectSchema(
       {
         project: {
@@ -79,7 +81,10 @@ export default function supervisorExtension(pi: PiExtensionApi) {
         },
         kind: enumSchema(["implement", "investigate"]),
         instruction: stringSchema(),
-        review: booleanSchema(),
+        review: {
+          ...booleanSchema(),
+          description: "Review implementation Tasks by default; false opts out.",
+        },
         project_name: { ...stringSchema(), description: "Required to register a new Project." },
         project_location: {
           ...stringSchema(),
@@ -87,7 +92,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
         },
         remote_action: enumSchema(["clone", "review_only"]),
       },
-      ["project", "kind", "instruction", "review"],
+      ["project", "kind", "instruction"],
     ),
     async execute(_id: string, params: DelegateParams) {
       const { paths, store } = await openSwitchYard();
@@ -104,14 +109,43 @@ export default function supervisorExtension(pi: PiExtensionApi) {
 
         if (!project && isRemoteGitUrl(params.project)) {
           if (params.remote_action === "review_only") {
+            if (params.kind !== "investigate") {
+              return result({
+                status: "project_intake_required",
+                project: params.project,
+                message:
+                  "Implementation requires a registered Project. Choose clone with a Project name and destination; review-only supports investigation Tasks.",
+                required_for_clone: ["project_name", "project_location"],
+              });
+            }
+            reviewPolicyForTask(params.kind, params.review);
+            const task = createTransientInvestigation(
+              store,
+              paths,
+              params.project,
+              params.instruction,
+            );
+            try {
+              await startTask(store, paths, task.id);
+              await startWorker(store, paths, task.id);
+            } catch (error) {
+              const current = store.getTask(task.id);
+              if (current && (current.state === "queued" || current.state === "starting")) {
+                failTask(
+                  store,
+                  task.id,
+                  `worker startup failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                await quiesceTaskRuntimes(store, task.id);
+              }
+            }
+            const finalTask = store.getTask(task.id) ?? task;
             return result({
-              status: "review_only",
-              project: params.project,
-              cloned: false,
+              status: finalTask.state === "failed" ? "task_failed" : "task_started",
+              source: params.project,
               registered: false,
-              task_started: false,
-              message:
-                "No clone, Project registration, or Task was created. Provide a local checkout or explicitly choose clone with a name and destination to delegate work.",
+              task_started: finalTask.state === "running",
+              task: taskView(store, finalTask),
             });
           }
           if (params.remote_action !== "clone") {
@@ -163,7 +197,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
           project.id,
           params.kind,
           params.instruction,
-          params.review ? "loop" : "off",
+          reviewPolicyForTask(params.kind, params.review),
         );
         try {
           await startTask(store, paths, task.id);
@@ -392,9 +426,9 @@ function resolveTask(
   if (exact.length > 1) return { matches: exact };
   const terms = query.split(/\s+/).filter(Boolean);
   const matches = tasks.filter((task) => {
-    const project = store.getProject(task.project_id);
+    const project = task.project_id ? store.getProject(task.project_id) : undefined;
     const haystack = normalize(
-      `${project?.name ?? ""} ${taskTitle(task)} ${task.instruction} ${task.summary ?? ""}`,
+      `${project?.name ?? task.source_url ?? ""} ${taskTitle(task)} ${task.instruction} ${task.summary ?? ""}`,
     );
     return haystack.includes(query) || terms.every((term) => haystack.includes(term));
   });
@@ -427,12 +461,12 @@ function taskResolutionView(
 }
 
 function taskView(store: Awaited<ReturnType<typeof openSwitchYard>>["store"], task: TaskRecord) {
-  const project = store.getProject(task.project_id);
+  const project = task.project_id ? store.getProject(task.project_id) : undefined;
   const decision = store.getOpenDecision(task.id);
   const review = store.getLatestReview(task.id);
   const workspace = store.getWorkspace(task.id);
   return {
-    project: project?.name || "Unknown Project",
+    project: project?.name ?? task.source_url ?? "Transient source",
     task: taskTitle(task),
     kind: task.kind,
     state: task.state,
@@ -457,7 +491,7 @@ function taskView(store: Awaited<ReturnType<typeof openSwitchYard>>["store"], ta
 }
 
 function taskTitle(task: TaskRecord): string {
-  const value = (task.summary || task.instruction).replace(/\s+/g, " ").trim();
+  const value = task.title.replace(/\s+/g, " ").trim();
   return value.length > 120 ? `${value.slice(0, 117)}...` : value;
 }
 
@@ -465,8 +499,8 @@ function taskReference(
   store: Awaited<ReturnType<typeof openSwitchYard>>["store"],
   task: TaskRecord,
 ): string {
-  const project = store.getProject(task.project_id);
-  return `${project?.name || "Project"} / ${taskTitle(task)}`;
+  const project = task.project_id ? store.getProject(task.project_id) : undefined;
+  return `${project?.name ?? task.source_url ?? "Transient source"} / ${taskTitle(task)}`;
 }
 
 function projectView(project: ProjectRecord) {

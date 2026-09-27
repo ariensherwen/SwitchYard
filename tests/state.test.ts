@@ -5,7 +5,15 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 import { StateStore } from "../src/state.ts";
-import { cancelTask, createTask, markWaiting, resumeWaiting, transition } from "../src/tasks.ts";
+import {
+  cancelTask,
+  createTask,
+  failTask,
+  markWaiting,
+  resumeWaiting,
+  transition,
+  updateTaskTitle,
+} from "../src/tasks.ts";
 
 const dirs: string[] = [];
 afterEach(async () =>
@@ -33,7 +41,7 @@ test("migrations are repeatable and durable", async () => {
   assert.equal(reopened.listTasks().length, 1);
   assert.equal(
     (reopened.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-    3,
+    4,
   );
   reopened.close();
 });
@@ -45,11 +53,37 @@ test("schema migration reserves one active Review per candidate", async () => {
   const legacy = new DatabaseSync(dbPath);
   legacy.exec(`
     CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      kind TEXT NOT NULL CHECK(kind IN ('implement','investigate')),
+      instruction TEXT NOT NULL,
+      review_policy TEXT NOT NULL CHECK(review_policy IN ('off','loop')),
+      state TEXT NOT NULL,
+      base_sha TEXT,
+      candidate_sha TEXT,
+      summary TEXT,
+      verification_summary TEXT,
+      failure TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
     CREATE TABLE workspaces (
       task_id TEXT PRIMARY KEY,
       path TEXT NOT NULL UNIQUE,
       branch TEXT NOT NULL UNIQUE,
       created_at TEXT NOT NULL
+    );
+    CREATE TABLE decisions (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      question TEXT NOT NULL,
+      context TEXT,
+      options_json TEXT,
+      state TEXT NOT NULL CHECK(state IN ('open','resolved')),
+      answer TEXT,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
     );
     CREATE TABLE reviews (
       id TEXT PRIMARY KEY,
@@ -76,6 +110,15 @@ test("schema migration reserves one active Review per candidate", async () => {
     .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('legacy-project', ?, ?)")
     .run(dir, "2025-01-01T00:00:00.000Z");
   legacy
+    .prepare(`INSERT INTO tasks(
+      id, project_id, kind, instruction, review_policy, state, created_at, updated_at
+    ) VALUES ('legacy-task', 'legacy-project', 'implement', 'legacy instruction', 'off', 'queued', ?, ?)`)
+    .run("2025-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z");
+  legacy
+    .prepare(`INSERT INTO decisions(id, task_id, question, state, created_at)
+      VALUES ('legacy-decision', 'legacy-task', 'Legacy question?', 'open', ?)`)
+    .run("2025-01-01T00:00:00.000Z");
+  legacy
     .prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
     .run("legacy-task", path.join(dir, "workspace"), "legacy-branch", "2025-01-01T00:00:00.000Z");
   legacy
@@ -90,6 +133,10 @@ test("schema migration reserves one active Review per candidate", async () => {
 
   const store = new StateStore(dbPath);
   assert.equal(store.getProject("legacy-project")?.name, path.basename(dir));
+  assert.equal(store.getTask("legacy-task")?.title, "legacy instruction");
+  assert.equal(store.getTask("legacy-task")?.project_id, "legacy-project");
+  assert.equal(store.getDecision("legacy-decision")?.state, "open");
+  assert.equal(store.db.prepare("PRAGMA foreign_key_check").all().length, 0);
   assert.equal(store.getWorkspace("legacy-task")?.provisioned, 1);
   assert.equal(store.getReview("old-review")?.state, "failed");
   assert.equal(store.getReview("new-review")?.state, "running");
@@ -106,6 +153,18 @@ test("schema migration reserves one active Review per candidate", async () => {
   store.close();
 });
 
+test("Task titles are persisted independently from completion summaries and mutable", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "Implement stable identity", "off");
+  store.db.prepare("UPDATE tasks SET summary=? WHERE id=?").run("Completed change", task.id);
+  assert.equal(store.getTask(task.id)?.title, "Implement stable identity");
+
+  updateTaskTitle(store, task.id, "Stable task title");
+  assert.equal(store.getTask(task.id)?.title, "Stable task title");
+  assert.ok(store.listEvents(task.id).some((event) => event.type === "task.title_updated"));
+  store.close();
+});
+
 test("canonical task transitions reject illegal resurrection", async () => {
   const store = await fixture();
   const task = createTask(store, "p", "implement", "change x", "off");
@@ -119,6 +178,22 @@ test("canonical task transitions reject illegal resurrection", async () => {
     () => transition(store, task.id, "cancelled", "running", "bad"),
     /illegal task transition/,
   );
+  store.close();
+});
+
+test("reviewing Tasks cannot complete without a clean Review of the current candidate", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "review gate", "loop");
+  transition(store, task.id, "queued", "starting", "task.starting");
+  transition(store, task.id, "starting", "running", "task.started");
+  store.db.prepare("UPDATE tasks SET candidate_sha=? WHERE id=?").run("candidate", task.id);
+  transition(store, task.id, "running", "reviewing", "task.reviewing");
+
+  assert.throws(
+    () => transition(store, task.id, "reviewing", "completed", "task.completed"),
+    /requires a clean Review of its current candidate/,
+  );
+  assert.equal(store.getTask(task.id)?.state, "reviewing");
   store.close();
 });
 
@@ -216,6 +291,46 @@ test("resume transition and required Worker Message roll back together", async (
     false,
   );
   assert.equal(store.listPendingMessages(task.id, "worker").length, 0);
+  store.close();
+});
+
+test("terminal Tasks cancel open Decisions with a durable Event", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "blocked task", "off");
+  transition(store, task.id, "queued", "starting", "task.starting");
+  transition(store, task.id, "starting", "running", "task.started");
+  const { requestDecision } = await import("../src/tasks.ts");
+  const decisionId = requestDecision(store, task.id, "Choose?", undefined, ["a", "b"]);
+
+  cancelTask(store, task.id);
+
+  const decision = store.getDecision(decisionId);
+  assert.equal(decision?.state, "cancelled");
+  assert.ok(decision?.resolved_at);
+  assert.ok(
+    store
+      .listEvents(task.id)
+      .some(
+        (event) => event.type === "decision.cancelled" && event.payload_json.includes("cancelled"),
+      ),
+  );
+  assert.equal(store.getOpenDecision(task.id), undefined);
+  store.close();
+});
+
+test("failing a Task cancels its open Decision", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "failed blocked task", "off");
+  transition(store, task.id, "queued", "starting", "task.starting");
+  transition(store, task.id, "starting", "running", "task.started");
+  const { requestDecision } = await import("../src/tasks.ts");
+  const decisionId = requestDecision(store, task.id, "Choose?", undefined, ["a", "b"]);
+
+  failTask(store, task.id, "forced failure");
+
+  assert.equal(store.getTask(task.id)?.state, "failed");
+  assert.equal(store.getDecision(decisionId)?.state, "cancelled");
+  assert.equal(store.getOpenDecision(task.id), undefined);
   store.close();
 });
 

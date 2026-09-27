@@ -35,6 +35,14 @@ export async function cloneRepository(remoteUrl: string, destination: string): P
   await git(path.dirname(absoluteDestination), ["clone", "--", remoteUrl, absoluteDestination]);
 }
 
+export async function ensureTransientRepository(
+  remoteUrl: string,
+  destination: string,
+): Promise<string> {
+  if (!existsSync(destination)) await cloneRepository(remoteUrl, destination);
+  return await canonicalRepositoryRoot(destination);
+}
+
 export async function assertProjectClean(root: string): Promise<void> {
   const { stdout } = await git(root, ["status", "--porcelain"]);
   if (stdout.trim()) throw new Error(`project checkout is dirty: ${root}`);
@@ -166,6 +174,21 @@ export async function validateReviewCheckout(
     throw new Error("review checkout no longer points at the candidate revision");
   const status = (await git(reviewPath, ["status", "--porcelain"])).stdout.trim();
   if (status) throw new Error("review checkout must be clean before certification");
+}
+
+export async function canSafelyCleanTransient(
+  sourceRoot: string,
+  workspace: string,
+  baseSha: string,
+): Promise<boolean> {
+  const sourceStatus = (
+    await git(sourceRoot, ["status", "--porcelain", "--ignored"])
+  ).stdout.trim();
+  const workspaceStatus = (
+    await git(workspace, ["status", "--porcelain", "--ignored"])
+  ).stdout.trim();
+  if (sourceStatus || workspaceStatus) return false;
+  return (await currentHead(sourceRoot)) === baseSha && (await currentHead(workspace)) === baseSha;
 }
 
 export async function canSafelyClean(

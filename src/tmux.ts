@@ -1,8 +1,20 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
+import { resolveSwitchYardHome } from "./home.ts";
 
 const execFileAsync = promisify(execFile);
-export const TMUX_SESSION = process.env.SWITCHYARD_TMUX_SESSION || "switchyard";
+export function tmuxSessionForHome(home: string): string {
+  const canonicalHome = resolveSwitchYardHome({ SWITCHYARD_HOME: home });
+  const namespace = createHash("sha256").update(canonicalHome).digest("hex").slice(0, 12);
+  return `switchyard-${namespace}`;
+}
+
+export function resolveTmuxSession(env: NodeJS.ProcessEnv = process.env): string {
+  return env.SWITCHYARD_TMUX_SESSION || tmuxSessionForHome(resolveSwitchYardHome(env));
+}
+
+export const TMUX_SESSION = resolveTmuxSession();
 
 export async function ensureSession(): Promise<void> {
   if (!(await hasSession())) {

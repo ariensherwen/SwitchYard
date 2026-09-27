@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { openSwitchYard } from "./context.ts";
@@ -14,11 +15,13 @@ import {
   createTask,
   failTask,
   resolveDecision,
+  reviewPolicyForTask,
   startTask,
   steerTask,
+  taskSourceRoot,
 } from "./tasks.ts";
 import { attachWindow, ensureWindow } from "./tmux.ts";
-import { canSafelyClean, removeWorktree } from "./worktree.ts";
+import { canSafelyClean, canSafelyCleanTransient, removeWorktree } from "./worktree.ts";
 
 const HELP = `SwitchYard
 
@@ -27,7 +30,7 @@ Usage:
   switchyard doctor
   switchyard project add [path]
   switchyard project list
-  switchyard task create <project-id> [--kind implement|investigate] [--review] <instruction>
+  switchyard task create <project-id> [--kind implement|investigate] [--no-review] <instruction>
   switchyard task list
   switchyard task show <task-id>
   switchyard task send <task-id> <message>
@@ -123,7 +126,8 @@ async function handleTask(
       strict: true,
       options: {
         kind: { type: "string", default: "implement" },
-        review: { type: "boolean", default: false },
+        review: { type: "boolean" },
+        "no-review": { type: "boolean", default: false },
       },
     });
     const [projectId, ...instructionParts] = parsed.positionals;
@@ -131,13 +135,15 @@ async function handleTask(
       throw new Error("task create requires <project-id> and <instruction>");
     if (parsed.values.kind !== "implement" && parsed.values.kind !== "investigate")
       throw new Error("--kind must be implement or investigate");
+    if (parsed.values.kind === "investigate" && args.slice(1).includes("--review"))
+      throw new Error("--review is supported only for implement tasks");
     if (!store.getProject(projectId)) throw new Error(`project not found: ${projectId}`);
     const task = createTask(
       store,
       projectId,
       parsed.values.kind,
       instructionParts.join(" "),
-      parsed.values.review ? "loop" : "off",
+      reviewPolicyForTask(parsed.values.kind, parsed.values["no-review"] ? false : undefined),
     );
     try {
       await startTask(store, paths, task.id);
@@ -157,7 +163,7 @@ async function handleTask(
   }
   if (command === "list") {
     for (const task of store.listTasks())
-      console.log(`${task.id}\t${task.state}\t${task.kind}\t${task.project_id}`);
+      console.log(`${task.id}\t${task.state}\t${task.kind}\t${task.project_id ?? task.source_url}`);
     return 0;
   }
   const taskId = args[1];
@@ -209,14 +215,27 @@ async function handleTask(
       );
     }
     const workspace = store.getWorkspace(taskId);
-    const project = store.getProject(task.project_id);
-    if (!workspace || !project || !task.base_sha) throw new Error("task workspace is incomplete");
-    if (!(await canSafelyClean(project.root_path, workspace.path, task.base_sha))) {
-      throw new Error(
-        "refusing cleanup: workspace is dirty or contains commits not landed in the registered Project HEAD",
-      );
+    if (!workspace || !task.base_sha) throw new Error("task workspace is incomplete");
+    const sourceRoot = taskSourceRoot(store, task);
+    if (task.source_path) {
+      const expectedSource = path.resolve(paths.sources, task.id);
+      if (path.resolve(task.source_path) !== expectedSource)
+        throw new Error("refusing cleanup: transient source path is outside the SwitchYard home");
+      if (!(await canSafelyCleanTransient(sourceRoot, workspace.path, task.base_sha))) {
+        throw new Error(
+          "refusing cleanup: transient source or task Workspace contains uncommitted work",
+        );
+      }
+      await removeWorktree(sourceRoot, workspace.path);
+      await rm(sourceRoot, { recursive: true });
+    } else {
+      if (!(await canSafelyClean(sourceRoot, workspace.path, task.base_sha))) {
+        throw new Error(
+          "refusing cleanup: workspace is dirty or contains commits not landed in the registered Project HEAD",
+        );
+      }
+      await removeWorktree(sourceRoot, workspace.path);
     }
-    await removeWorktree(project.root_path, workspace.path);
     return 0;
   }
   throw new Error(`unknown task command: ${command}`);

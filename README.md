@@ -25,7 +25,7 @@ switchyard doctor
 switchyard
 ```
 
-SwitchYard initializes `${SWITCHYARD_HOME:-~/.switchyard}`, reconciles durable state, ensures the dedicated `switchyard` tmux session, starts the Supervisor Pi from `$SWITCHYARD_HOME/supervisor`, and attaches to it. Running the command from inside tmux switches the current client instead of nesting sessions.
+SwitchYard initializes `${SWITCHYARD_HOME:-~/.switchyard}`, reconciles durable state, ensures a tmux session namespaced to that home, starts the Supervisor Pi from `$SWITCHYARD_HOME/supervisor`, and attaches to it. Running the command from inside tmux switches the current client instead of nesting sessions.
 
 Set a different state root with:
 
@@ -42,17 +42,17 @@ switchyard project add /path/to/repo
 switchyard project list
 ```
 
-The Supervisor uses Project names and natural phrases from Task instructions or summaries. Its task list and detail tools omit internal UUIDs; steering, cancellation, and Decision answers take a natural Task reference. For example, a new checkout requires a name and location. An unknown remote URL opens intake: cloning requires explicit approval plus a Project name and destination; choosing review-only creates no clone, Project, or Task.
+The Supervisor uses Project names and Task titles or natural descriptions. Its task list and detail tools omit internal UUIDs; steering, cancellation, and Decision answers take a natural Task reference. An unknown remote URL opens intake: implementation requires explicit approval, a Project name, and a clone destination. Review-only starts an investigation Task from a temporary checkout without registering a Project.
 
 Create and immediately dispatch work from the CLI:
 
 ```sh
 switchyard task create <project-id> "Implement the requested change"
 switchyard task create <project-id> --kind investigate "Investigate the failure"
-switchyard task create <project-id> --review "Implement and independently review the change"
+switchyard task create <project-id> --no-review "Implement without the review loop"
 ```
 
-Each Task owns one worktree under `$SWITCHYARD_HOME/worktrees/<project-id>/<task-id>` on branch `switchyard/task-<task-id>`. The registered Project checkout must be clean when a Task starts.
+Each Task owns one worktree under `$SWITCHYARD_HOME/worktrees/<project-id>/<task-id>` on branch `switchyard/task-<task-id>`. Transient investigations use `$SWITCHYARD_HOME/worktrees/transient/<task-id>` and a task-owned source clone under `$SWITCHYARD_HOME/sources/<task-id>`. Registered Project checkouts must be clean when a Task starts.
 
 Inspect and steer tasks:
 
@@ -66,19 +66,19 @@ switchyard task cancel <task-id>
 switchyard task clean <task-id>
 ```
 
-Messages and Decision answers are stored before delivery. Cancellation stops active runtimes but preserves the task Workspace. `task clean` refuses deletion when the task branch contains commits that are not ancestors of the registered Project's current HEAD; there is no force cleanup in 0.1.0.
+Messages and Decision answers are stored before delivery. Cancellation stops active runtimes but preserves the task Workspace. Terminalizing a Task cancels any open Decision. `task clean` refuses deletion when a registered Project workspace contains unlanded commits, or when a transient source or workspace contains uncommitted work; there is no force cleanup.
 
 ## Completion and review
 
 Workers complete through structured SwitchYard tools rather than terminal prose. Implement Tasks must submit a clean committed candidate on the expected branch that descends from the captured base revision.
 
-Review is opt-in with `--review` and is available only for `implement` Tasks. Every review runs in a fresh Pi session and detached review worktree at one exact candidate SHA. A clean result is accepted only when it covers the complete changed-path set, contains no findings, the review checkout is clean, and the Worker Workspace still points at the reviewed candidate. Findings return the Task to its Worker for another revision.
+Review is enabled by default for `implement` Tasks; `--no-review` opts out. `investigate` Tasks are never reviewed. Every review runs in a fresh Pi session and detached review worktree at one exact candidate SHA. A clean result is accepted only when it covers the complete changed-path set, contains no findings, the review checkout is clean, and the Worker Workspace still points at the reviewed candidate. Findings return the Task to its Worker for another revision.
 
 ## Durable state and recovery
 
-SQLite state lives at `$SWITCHYARD_HOME/switchyard.db` with foreign keys, WAL, and a busy timeout enabled. SwitchYard persists Projects, Tasks, Workspaces, Worker history, Messages, Decisions, Reviews, Findings, and Events.
+SQLite state lives at `$SWITCHYARD_HOME/switchyard.db` with foreign keys, WAL, and a busy timeout enabled. SwitchYard persists Projects, Tasks and their titles/sources, Workspaces, Worker history, Messages, Decisions, Reviews, Findings, and Events.
 
-Startup reconciliation resumes Tasks left queued, completes Workspace reservations interrupted before or after `git worktree add`, preserves waiting Decisions, does not resurrect terminal Tasks, replaces missing Workers in the same task-owned Workspace, and restarts interrupted Reviews for the same candidate. A missing provisioned Workspace still fails its nonterminal Task rather than silently recreating it. Terminalizing a Task also aborts any running Review durably; reconciliation cleans up its runtime and worktree.
+Startup reconciliation resumes queued Tasks, completes Workspace reservations interrupted before or after `git worktree add`, preserves waiting Decisions, does not resurrect terminal Tasks, replaces missing Workers in the same task-owned Workspace, and restarts interrupted Reviews for the same candidate. Resuming a waiting Task or answering a Decision ensures a live Worker before returning. A missing provisioned Workspace still fails its nonterminal Task rather than silently recreating it. Terminalizing a Task cancels any open Decision and aborts a running Review durably; reconciliation cleans up runtimes and review worktrees.
 
 ## Development
 

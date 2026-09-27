@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { getSwitchYardPaths } from "../src/home.ts";
 import { beginReview, submitReview } from "../src/review.ts";
 import { StateStore } from "../src/state.ts";
-import { createTask, steerTask, submitCandidate } from "../src/tasks.ts";
+import { completeRecoveredReview, createTask, steerTask, submitCandidate } from "../src/tasks.ts";
 import { createWorkspace } from "../src/worktree.ts";
 
 const exec = promisify(execFile);
@@ -89,6 +89,24 @@ test("clean review certifies exact candidate and completes task", async () => {
   });
   assert.equal(store.getTask(taskId)?.state, "completed");
   assert.equal(store.getReview(reviewId)?.state, "clean");
+  store.close();
+});
+
+test("recovery completion requires a clean Review for the current candidate", async () => {
+  const { store, paths, taskId } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+  const task = store.getTask(taskId);
+  assert.ok(task?.candidate_sha);
+
+  assert.throws(
+    () => completeRecoveredReview(store, taskId, task.candidate_sha ?? "", reviewId),
+    /requires a clean Review/,
+  );
+  assert.equal(store.getTask(taskId)?.state, "reviewing");
+
+  store.db.prepare("UPDATE reviews SET state='clean' WHERE id=?").run(reviewId);
+  assert.equal(completeRecoveredReview(store, taskId, task.candidate_sha, reviewId), true);
+  assert.equal(store.getTask(taskId)?.state, "completed");
   store.close();
 });
 

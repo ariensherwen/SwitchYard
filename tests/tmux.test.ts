@@ -6,7 +6,9 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 const session = `switchyard-test-${process.pid}`;
 process.env.SWITCHYARD_TMUX_SESSION = session;
-const { attachWindow, killWindow, windowAlive } = await import("../src/tmux.ts");
+const { attachWindow, killWindow, resolveTmuxSession, windowAlive } = await import(
+  "../src/tmux.ts"
+);
 const hasTmux = await exec("tmux", ["-V"]).then(
   () => true,
   () => false,
@@ -14,6 +16,17 @@ const hasTmux = await exec("tmux", ["-V"]).then(
 
 after(async () => {
   if (hasTmux) await exec("tmux", ["kill-session", "-t", session]).catch(() => undefined);
+});
+
+test("default tmux sessions are isolated by SwitchYard home", () => {
+  const first = resolveTmuxSession({ SWITCHYARD_HOME: "/tmp/switchyard-one" });
+  const second = resolveTmuxSession({ SWITCHYARD_HOME: "/tmp/switchyard-two" });
+  assert.notEqual(first, second);
+  assert.equal(
+    resolveTmuxSession({ SWITCHYARD_HOME: "/tmp/switchyard-one/..//switchyard-one" }),
+    first,
+  );
+  assert.equal(resolveTmuxSession({ SWITCHYARD_TMUX_SESSION: "explicit" }), "explicit");
 });
 
 test("real tmux session/window liveness", { skip: !hasTmux }, async () => {

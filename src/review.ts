@@ -37,8 +37,8 @@ export async function beginReview(
   if (task?.state !== "reviewing" || !task.candidate_sha)
     throw new Error("task is not ready for review");
   const candidateSha = task.candidate_sha;
-  const project = store.getProject(task.project_id);
-  if (!project) throw new Error("project not found");
+  const project = task.project_id ? store.getProject(task.project_id) : undefined;
+  if (!project) throw new Error("review requires a registered Project");
   const id = randomUUID();
   const reviewPath = path.join(paths.reviews, taskId, id);
   const tmuxWindow = `review-${taskId}-${id}`;

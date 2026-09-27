@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
+import { promisify } from "node:util";
 import type { PiExtensionApi, PiLifecycleEvent, PiToolDefinition } from "../extensions/pi-types.ts";
 import reviewerExtension from "../extensions/reviewer.ts";
 import supervisorExtension from "../extensions/supervisor.ts";
@@ -12,6 +15,7 @@ import { enqueueMessage, signalWake } from "../src/inbox.ts";
 import { now, StateStore } from "../src/state.ts";
 import { createTask, transition } from "../src/tasks.ts";
 
+const exec = promisify(execFile);
 const dirs: string[] = [];
 const savedEnv = { ...process.env };
 
@@ -204,7 +208,7 @@ test("Supervisor contract uses natural Task references and omits internal record
   store.close();
 });
 
-test("unknown projects enter intake and remote review-only creates nothing", async () => {
+test("unknown projects enter intake and remote implementation requires a registered Project", async () => {
   const { store } = await fixture();
   const fake = fakePi();
   supervisorExtension(fake.api);
@@ -212,10 +216,14 @@ test("unknown projects enter intake and remote review-only creates nothing", asy
     project: string;
     kind: "implement" | "investigate";
     instruction: string;
-    review: boolean;
+    review?: boolean;
     remote_action?: "clone" | "review_only";
   }>("switchyard_delegate");
   assert.ok(delegate);
+  assert.equal(
+    ((delegate.parameters as { required?: string[] }).required ?? []).includes("review"),
+    false,
+  );
 
   const unknown = (await delegate.execute("call", {
     project: "unknown-project",
@@ -245,24 +253,75 @@ test("unknown projects enter intake and remote review-only creates nothing", asy
   assert.deepEqual(cloneNeedsDetails.details.required, ["project_name", "project_location"]);
   const remote = (await delegate.execute("call", {
     project: "https://example.invalid/repo.git",
-    kind: "investigate",
-    instruction: "Review only",
+    kind: "implement",
+    instruction: "Implement the remote change",
     review: false,
     remote_action: "review_only",
-  })) as {
-    details: { status: string; cloned: boolean; registered: boolean; task_started: boolean };
-  };
-  assert.deepEqual(remote.details, {
-    status: "review_only",
-    project: "https://example.invalid/repo.git",
-    cloned: false,
-    registered: false,
-    task_started: false,
-    message:
-      "No clone, Project registration, or Task was created. Provide a local checkout or explicitly choose clone with a name and destination to delegate work.",
-  });
+  })) as { details: { status: string; message: string; required_for_clone: string[] } };
+  assert.equal(remote.details.status, "project_intake_required");
+  assert.match(remote.details.message, /Implementation requires a registered Project/);
+  assert.deepEqual(remote.details.required_for_clone, ["project_name", "project_location"]);
   assert.equal(store.listProjects().length, 1);
   assert.equal(store.listTasks().length, 1);
+  store.close();
+});
+
+test("review-only remote investigation uses a transient checkout without Project registration", async () => {
+  const { paths, store } = await fixture();
+  const root = path.dirname(paths.home);
+  const remote = path.join(root, "remote");
+  const bin = path.join(root, "bin");
+  const tmuxState = path.join(root, "fake-tmux-state");
+  await mkdir(remote);
+  await mkdir(bin);
+  await exec("git", ["init", "-b", "main"], { cwd: remote });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: remote });
+  await exec("git", ["config", "user.name", "SwitchYard Test"], { cwd: remote });
+  await writeFile(path.join(remote, "README.md"), "remote source\n");
+  await exec("git", ["add", "."], { cwd: remote });
+  await exec("git", ["commit", "-m", "remote base"], { cwd: remote });
+  const { stdout: gitPath } = await exec("which", ["git"]);
+  const remoteUrl = "https://example.invalid/repo.git";
+  await writeFile(
+    path.join(bin, "git"),
+    `#!/usr/bin/env bash\nif [[ "$1" == clone && "$3" == ${JSON.stringify(remoteUrl)} ]]; then\n  exec ${JSON.stringify(gitPath.trim())} clone -- ${JSON.stringify(remote)} "$4"\nfi\nexec ${JSON.stringify(gitPath.trim())} "$@"\n`,
+  );
+  await writeFile(
+    path.join(bin, "tmux"),
+    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(tmuxState)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) i=0; while IFS= read -r name; do i=$((i+1)); printf '@%s\\t%s\\n' "$i" "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  *) : ;;\nesac\n`,
+  );
+  await chmod(path.join(bin, "git"), 0o755);
+  await chmod(path.join(bin, "tmux"), 0o755);
+  process.env.PATH = `${bin}:${process.env.PATH}`;
+  process.env.SWITCHYARD_HOME = paths.home;
+  const fake = fakePi();
+  supervisorExtension(fake.api);
+  const delegate = fake.getTool<{
+    project: string;
+    kind: "implement" | "investigate";
+    instruction: string;
+    remote_action: "review_only";
+  }>("switchyard_delegate");
+  assert.ok(delegate);
+
+  const response = (await delegate.execute("call", {
+    project: remoteUrl,
+    kind: "investigate",
+    instruction: "Inspect the remote source",
+    remote_action: "review_only",
+  })) as { details: { status: string; registered: boolean; task_started: boolean } };
+
+  assert.equal(response.details.status, "task_started");
+  assert.equal(response.details.registered, false);
+  assert.equal(response.details.task_started, true);
+  assert.equal(store.listProjects().length, 1);
+  const task = store.listTasks().find((record) => record.source_url === remoteUrl);
+  assert.ok(task);
+  assert.equal(task.project_id, null);
+  assert.equal(task.review_policy, "off");
+  assert.equal(task.state, "running");
+  assert.ok(task.source_path && existsSync(task.source_path));
+  assert.ok(store.getWorkspace(task.id)?.provisioned);
   store.close();
 });
 
