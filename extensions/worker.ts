@@ -116,7 +116,8 @@ export default function workerExtension(pi: PiExtensionApi) {
   pi.registerTool({
     name: "switchyard_wait",
     label: "Wait",
-    description: "Explicitly mark this Task waiting for external input or a later steering message.",
+    description:
+      "Explicitly mark this Task waiting for external input or a later steering message.",
     parameters: objectSchema({ reason: stringSchema() }, ["reason"]),
     async execute(_id: string, params: WaitParams) {
       const { paths, store } = await openSwitchYard();
@@ -167,8 +168,12 @@ export default function workerExtension(pi: PiExtensionApi) {
     const { store } = await openSwitchYard();
     try {
       const task = store.getTask(taskId);
-      if (task?.state === "running" && store.getActiveWorker(taskId)?.id === workerId) return undefined;
-      return { block: true, reason: `Task ${taskId} is not running; Worker mutation authority is suspended.` };
+      if (task?.state === "running" && store.getActiveWorker(taskId)?.id === workerId)
+        return undefined;
+      return {
+        block: true,
+        reason: `Task ${taskId} is not running; Worker mutation authority is suspended.`,
+      };
     } finally {
       store.close();
     }

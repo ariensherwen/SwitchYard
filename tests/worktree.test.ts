@@ -6,11 +6,11 @@ import path from "node:path";
 import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 import {
-  canSafelyClean,
   canonicalRepositoryRoot,
+  canSafelyClean,
   createWorkspace,
-  validateImplementCandidate,
   removeWorktree,
+  validateImplementCandidate,
 } from "../src/worktree.ts";
 
 const exec = promisify(execFile);
@@ -67,7 +67,6 @@ test("dirty registered project is rejected before worktree creation", async () =
     /checkout is dirty/,
   );
 });
-
 
 test("cleanup refuses dirty worktree and failed Git removal preserves files", async () => {
   const root = await repo();

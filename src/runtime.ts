@@ -143,7 +143,9 @@ async function launchReservedWorker(
 function activateWorkerAndTask(store: StateStore, taskId: string, workerId: string): void {
   store.transaction(() => {
     const worker = store.db
-      .prepare("UPDATE workers SET state='active' WHERE id=? AND task_id=? AND state IN ('starting','active')")
+      .prepare(
+        "UPDATE workers SET state='active' WHERE id=? AND task_id=? AND state IN ('starting','active')",
+      )
       .run(workerId, taskId);
     if (worker.changes !== 1) throw new Error("reserved Worker identity is no longer live");
     casTransition(store, taskId, "starting", "running");
@@ -182,7 +184,8 @@ export function retireWorker(
         "UPDATE workers SET state='stopped', ended_at=? WHERE id=? AND task_id=? AND state IN ('starting','active')",
       )
       .run(now(), workerId, taskId);
-    if (changed.changes === 1) store.event(taskId, "worker.stopped", { worker_id: workerId, reason });
+    if (changed.changes === 1)
+      store.event(taskId, "worker.stopped", { worker_id: workerId, reason });
   });
 }
 
@@ -275,11 +278,16 @@ export async function startReviewer(
     prompt,
   );
   await ensureWindow(review.tmux_window, launch.cwd, shellCommand(launch));
-  if (!(await windowAlive(review.tmux_window))) throw new Error("Reviewer Pi exited during startup");
+  if (!(await windowAlive(review.tmux_window)))
+    throw new Error("Reviewer Pi exited during startup");
   store.event(task.id, "reviewer.started", { review_id: reviewId, window: review.tmux_window });
 }
 
-function buildWorkerDispatchContext(store: StateStore, taskId: string, replacement: boolean): string {
+function buildWorkerDispatchContext(
+  store: StateStore,
+  taskId: string,
+  replacement: boolean,
+): string {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
   if (!task || !workspace) throw new Error("task context is incomplete");

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { watch, type FSWatcher } from "node:fs";
+import { type FSWatcher, watch } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { StateStore } from "./state.ts";

@@ -4,7 +4,14 @@ import { addProject } from "../src/projects.ts";
 import { reconcile } from "../src/reconcile.ts";
 import { quiesceTaskRuntimes, startWorker, wakeWorker } from "../src/runtime.ts";
 import type { MessageRecord, TaskKind } from "../src/state.ts";
-import { cancelTask, createTask, failTask, resolveDecision, startTask, steerTask } from "../src/tasks.ts";
+import {
+  cancelTask,
+  createTask,
+  failTask,
+  resolveDecision,
+  startTask,
+  steerTask,
+} from "../src/tasks.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
 import { booleanSchema, enumSchema, objectSchema, stringSchema } from "./schema.ts";
 
@@ -135,7 +142,10 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     name: "switchyard_send_message",
     label: "Steer task",
     description: "Persist steering for a nonterminal task and resume it when explicitly waiting.",
-    parameters: objectSchema({ task_id: stringSchema(), text: stringSchema() }, ["task_id", "text"]),
+    parameters: objectSchema({ task_id: stringSchema(), text: stringSchema() }, [
+      "task_id",
+      "text",
+    ]),
     async execute(_id: string, params: SendMessageParams) {
       const { paths, store } = await openSwitchYard();
       try {
@@ -223,7 +233,12 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     pi.setActiveTools(SUPERVISOR_TOOLS);
     const { paths, store } = await openSwitchYard();
     try {
-      stopWakePump ??= startWakePump(paths.wake, "supervisor.wake", deliverSupervisorMessages, 2000);
+      stopWakePump ??= startWakePump(
+        paths.wake,
+        "supervisor.wake",
+        deliverSupervisorMessages,
+        2000,
+      );
     } finally {
       store.close();
     }

@@ -11,55 +11,142 @@ import { StateStore } from "../src/state.ts";
 import { createTask, submitCandidate } from "../src/tasks.ts";
 import { createWorkspace } from "../src/worktree.ts";
 
-const exec = promisify(execFile); const dirs: string[] = [];
-afterEach(async () => Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true }))));
+const exec = promisify(execFile);
+const dirs: string[] = [];
+afterEach(async () =>
+  Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true }))),
+);
 
 async function fixture() {
-  const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-review-repo-")); dirs.push(root);
-  await exec("git", ["init", "-b", "main"], { cwd: root }); await exec("git", ["config", "user.email", "test@example.com"], { cwd: root }); await exec("git", ["config", "user.name", "Test"], { cwd: root });
-  await writeFile(path.join(root, "a.txt"), "a\n"); await exec("git", ["add", "."], { cwd: root }); await exec("git", ["commit", "-m", "base"], { cwd: root });
-  const home = await mkdtemp(path.join(os.tmpdir(), "switchyard-review-home-")); dirs.push(home); const paths = getSwitchYardPaths({ ...process.env, SWITCHYARD_HOME: home });
-  await Promise.all([paths.worktrees, paths.reviews].map(async (p) => { const { mkdir } = await import("node:fs/promises"); await mkdir(p, { recursive: true }); }));
-  const store = new StateStore(paths.database); store.db.prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, datetime('now'))").run(root);
+  const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-review-repo-"));
+  dirs.push(root);
+  await exec("git", ["init", "-b", "main"], { cwd: root });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  await exec("git", ["config", "user.name", "Test"], { cwd: root });
+  await writeFile(path.join(root, "a.txt"), "a\n");
+  await exec("git", ["add", "."], { cwd: root });
+  await exec("git", ["commit", "-m", "base"], { cwd: root });
+  const home = await mkdtemp(path.join(os.tmpdir(), "switchyard-review-home-"));
+  dirs.push(home);
+  const paths = getSwitchYardPaths({ ...process.env, SWITCHYARD_HOME: home });
+  await Promise.all(
+    [paths.worktrees, paths.reviews].map(async (p) => {
+      const { mkdir } = await import("node:fs/promises");
+      await mkdir(p, { recursive: true });
+    }),
+  );
+  const store = new StateStore(paths.database);
+  store.db
+    .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, datetime('now'))")
+    .run(root);
   const task = createTask(store, "p", "implement", "change a", "loop");
   store.db.prepare("UPDATE tasks SET state='starting' WHERE id=?").run(task.id);
-  const workspacePath = path.join(paths.worktrees, "p", task.id); const ws = await createWorkspace(root, workspacePath, `switchyard/task-${task.id}`);
-  store.db.prepare("INSERT INTO workspaces(task_id,path,branch,created_at) VALUES (?,?,?,datetime('now'))").run(task.id, ws.path, ws.branch);
-  store.db.prepare("UPDATE tasks SET state='running', base_sha=? WHERE id=?").run(ws.baseSha, task.id);
-  await writeFile(path.join(ws.path, "a.txt"), "changed\n"); await exec("git", ["add", "."], { cwd: ws.path }); await exec("git", ["commit", "-m", "change"], { cwd: ws.path });
+  const workspacePath = path.join(paths.worktrees, "p", task.id);
+  const ws = await createWorkspace(root, workspacePath, `switchyard/task-${task.id}`);
+  store.db
+    .prepare(
+      "INSERT INTO workspaces(task_id,path,branch,created_at) VALUES (?,?,?,datetime('now'))",
+    )
+    .run(task.id, ws.path, ws.branch);
+  store.db
+    .prepare("UPDATE tasks SET state='running', base_sha=? WHERE id=?")
+    .run(ws.baseSha, task.id);
+  await writeFile(path.join(ws.path, "a.txt"), "changed\n");
+  await exec("git", ["add", "."], { cwd: ws.path });
+  await exec("git", ["commit", "-m", "change"], { cwd: ws.path });
   await submitCandidate(store, task.id, "changed", "tests pass");
   return { store, paths, taskId: task.id, workspace: ws.path };
 }
 
 test("clean review certifies exact candidate and completes task", async () => {
-  const { store, paths, taskId } = await fixture(); const reviewId = await beginReview(store, paths, taskId);
-  await submitReview(store, reviewId, { verdict: "clean", summary: "clean", reviewed_paths: ["a.txt"], findings: [] });
-  assert.equal(store.getTask(taskId)?.state, "completed"); assert.equal(store.getReview(reviewId)?.state, "clean"); store.close();
+  const { store, paths, taskId } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+  await submitReview(store, reviewId, {
+    verdict: "clean",
+    summary: "clean",
+    reviewed_paths: ["a.txt"],
+    findings: [],
+  });
+  assert.equal(store.getTask(taskId)?.state, "completed");
+  assert.equal(store.getReview(reviewId)?.state, "clean");
+  store.close();
 });
 
 test("partial reviewed paths cannot certify clean", async () => {
-  const { store, paths, taskId } = await fixture(); const reviewId = await beginReview(store, paths, taskId);
-  await assert.rejects(() => submitReview(store, reviewId, { verdict: "clean", summary: "clean", reviewed_paths: [], findings: [] }), /exactly cover/);
-  assert.equal(store.getTask(taskId)?.state, "reviewing"); store.close();
+  const { store, paths, taskId } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+  await assert.rejects(
+    () =>
+      submitReview(store, reviewId, {
+        verdict: "clean",
+        summary: "clean",
+        reviewed_paths: [],
+        findings: [],
+      }),
+    /exactly cover/,
+  );
+  assert.equal(store.getTask(taskId)?.state, "reviewing");
+  store.close();
 });
 
 test("findings return task to running and same SHA cannot be resubmitted", async () => {
-  const { store, paths, taskId } = await fixture(); const reviewId = await beginReview(store, paths, taskId);
-  await submitReview(store, reviewId, { verdict: "changes_requested", summary: "fix", reviewed_paths: ["a.txt"], findings: [{ summary: "problem", rationale: "broken", required_change: "fix it", path: "a.txt", line: 1 }] });
-  assert.equal(store.getTask(taskId)?.state, "running"); assert.equal(store.listFindings(reviewId).length, 1);
-  await assert.rejects(() => submitCandidate(store, taskId, "same", "same"), /unchanged/); store.close();
+  const { store, paths, taskId } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+  await submitReview(store, reviewId, {
+    verdict: "changes_requested",
+    summary: "fix",
+    reviewed_paths: ["a.txt"],
+    findings: [
+      {
+        summary: "problem",
+        rationale: "broken",
+        required_change: "fix it",
+        path: "a.txt",
+        line: 1,
+      },
+    ],
+  });
+  assert.equal(store.getTask(taskId)?.state, "running");
+  assert.equal(store.listFindings(reviewId).length, 1);
+  await assert.rejects(() => submitCandidate(store, taskId, "same", "same"), /unchanged/);
+  store.close();
 });
 
 test("clean certification is stale if Worker Workspace advances", async () => {
-  const { store, paths, taskId, workspace } = await fixture(); const reviewId = await beginReview(store, paths, taskId);
-  await writeFile(path.join(workspace, "b.txt"), "later\n"); await exec("git", ["add", "."], { cwd: workspace }); await exec("git", ["commit", "-m", "later"], { cwd: workspace });
-  await assert.rejects(() => submitReview(store, reviewId, { verdict: "clean", summary: "clean", reviewed_paths: ["a.txt"], findings: [] }), /workspace changed/);
-  assert.equal(store.getTask(taskId)?.state, "reviewing"); store.close();
+  const { store, paths, taskId, workspace } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+  await writeFile(path.join(workspace, "b.txt"), "later\n");
+  await exec("git", ["add", "."], { cwd: workspace });
+  await exec("git", ["commit", "-m", "later"], { cwd: workspace });
+  await assert.rejects(
+    () =>
+      submitReview(store, reviewId, {
+        verdict: "clean",
+        summary: "clean",
+        reviewed_paths: ["a.txt"],
+        findings: [],
+      }),
+    /workspace changed/,
+  );
+  assert.equal(store.getTask(taskId)?.state, "reviewing");
+  store.close();
 });
 
 test("modified review checkout cannot certify clean", async () => {
-  const { store, paths, taskId } = await fixture(); const reviewId = await beginReview(store, paths, taskId); const review = store.getReview(reviewId)!;
+  const { store, paths, taskId } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+  const review = store.getReview(reviewId)!;
   await writeFile(path.join(review.path, "scratch.txt"), "modified\n");
-  await assert.rejects(() => submitReview(store, reviewId, { verdict: "clean", summary: "clean", reviewed_paths: ["a.txt"], findings: [] }), /review checkout must be clean/);
-  assert.equal(store.getTask(taskId)?.state, "reviewing"); store.close();
+  await assert.rejects(
+    () =>
+      submitReview(store, reviewId, {
+        verdict: "clean",
+        summary: "clean",
+        reviewed_paths: ["a.txt"],
+        findings: [],
+      }),
+    /review checkout must be clean/,
+  );
+  assert.equal(store.getTask(taskId)?.state, "reviewing");
+  store.close();
 });

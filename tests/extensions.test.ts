@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
@@ -7,7 +7,7 @@ import supervisorExtension from "../extensions/supervisor.ts";
 import workerExtension from "../extensions/worker.ts";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage, signalWake } from "../src/inbox.ts";
-import { StateStore, now } from "../src/state.ts";
+import { now, StateStore } from "../src/state.ts";
 import { createTask, transition } from "../src/tasks.ts";
 
 const dirs: string[] = [];
@@ -21,20 +21,29 @@ afterEach(async () => {
 async function fixture(state: "running" | "waiting" = "running") {
   const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-ext-"));
   dirs.push(root);
-  const paths = await ensureSwitchYardHome({ ...process.env, SWITCHYARD_HOME: path.join(root, "home") });
+  const paths = await ensureSwitchYardHome({
+    ...process.env,
+    SWITCHYARD_HOME: path.join(root, "home"),
+  });
   process.env.SWITCHYARD_HOME = paths.home;
   const store = new StateStore(paths.database);
-  store.db.prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, ?)").run(root, now());
+  store.db
+    .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, ?)")
+    .run(root, now());
   const task = createTask(store, "p", "implement", "Do the durable instruction", "off");
   transition(store, task.id, "queued", "starting", "task.starting");
   transition(store, task.id, "starting", "running", "task.started");
   if (state === "waiting") transition(store, task.id, "running", "waiting", "task.waiting");
   const workspace = path.join(root, "workspace");
   await mkdir(workspace);
-  store.db.prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
+  store.db
+    .prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
     .run(task.id, workspace, `switchyard/task-${task.id}`, now());
   const workerId = "worker-1";
-  store.db.prepare("INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'active', ?, ?)")
+  store.db
+    .prepare(
+      "INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'active', ?, ?)",
+    )
     .run(workerId, task.id, `task-${task.id}`, now());
   return { paths, store, taskId: task.id, workerId };
 }
@@ -46,10 +55,18 @@ function fakePi() {
   const activeTools: string[][] = [];
   return {
     api: {
-      registerTool(tool: any) { tools.set(tool.name, tool); },
-      on(event: string, handler: any) { handlers.set(event, handler); },
-      async sendUserMessage(text: string, options: unknown) { messages.push({ text, options }); },
-      setActiveTools(names: string[]) { activeTools.push([...names]); },
+      registerTool(tool: any) {
+        tools.set(tool.name, tool);
+      },
+      on(event: string, handler: any) {
+        handlers.set(event, handler);
+      },
+      async sendUserMessage(text: string, options: unknown) {
+        messages.push({ text, options });
+      },
+      setActiveTools(names: string[]) {
+        activeTools.push([...names]);
+      },
     } as any,
     tools,
     handlers,
@@ -101,7 +118,10 @@ test("Supervisor steering resumes a waiting Task through the shared domain opera
   await tool.execute("call", { task_id: taskId, text: "Resume with this guidance" });
 
   assert.equal(store.getTask(taskId)?.state, "running");
-  assert.match(store.listPendingMessages(taskId, "worker")[0]?.text ?? "", /Resume with this guidance/);
+  assert.match(
+    store.listPendingMessages(taskId, "worker")[0]?.text ?? "",
+    /Resume with this guidance/,
+  );
   store.close();
 });
 
@@ -114,14 +134,17 @@ test("Supervisor and Reviewer authority is mechanically allowlisted", async () =
   process.env.SWITCHYARD_HOME = path.join(root, "home");
   await supervisor.handlers.get("session_start")?.();
   const active = supervisor.activeTools.at(-1)!;
-  assert.deepEqual(active.sort(), [
-    "switchyard_cancel_task",
-    "switchyard_delegate",
-    "switchyard_get_task",
-    "switchyard_list_tasks",
-    "switchyard_resolve_decision",
-    "switchyard_send_message",
-  ].sort());
+  assert.deepEqual(
+    active.sort(),
+    [
+      "switchyard_cancel_task",
+      "switchyard_delegate",
+      "switchyard_get_task",
+      "switchyard_list_tasks",
+      "switchyard_resolve_decision",
+      "switchyard_send_message",
+    ].sort(),
+  );
   assert.equal(active.includes("bash"), false);
   assert.equal(active.includes("edit"), false);
   await supervisor.handlers.get("session_shutdown")?.();

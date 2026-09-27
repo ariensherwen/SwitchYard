@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage } from "../src/inbox.ts";
 import { resumeReservedWorker, startWorker } from "../src/runtime.ts";
-import { StateStore, now } from "../src/state.ts";
+import { now, StateStore } from "../src/state.ts";
 import { createTask, startTask } from "../src/tasks.ts";
 
 const exec = promisify(execFile);
@@ -35,7 +35,9 @@ async function fixture() {
   const home = path.join(root, "home");
   const paths = await ensureSwitchYardHome({ ...process.env, SWITCHYARD_HOME: home });
   const store = new StateStore(paths.database);
-  store.db.prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, ?)").run(repo, now());
+  store.db
+    .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, ?)")
+    .run(repo, now());
 
   const bin = path.join(root, "bin");
   const stateFile = path.join(root, "fake-tmux-state");
@@ -70,16 +72,26 @@ test("recovery launches the exact reserved Worker identity after crash-before-sp
   await startTask(store, paths, task.id);
   const workerId = "reserved-worker";
   store.db
-    .prepare("INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'starting', ?, ?)")
+    .prepare(
+      "INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'starting', ?, ?)",
+    )
     .run(workerId, task.id, `task-${task.id}`, now());
-  enqueueMessage(store, task.id, "worker", "Start this SwitchYard Task.\n\nInstruction:\nResume me");
+  enqueueMessage(
+    store,
+    task.id,
+    "worker",
+    "Start this SwitchYard Task.\n\nInstruction:\nResume me",
+  );
 
   const worker = store.getLiveWorker(task.id)!;
   await resumeReservedWorker(store, paths, worker);
 
   assert.equal(store.getTask(task.id)?.state, "running");
   assert.equal(store.getActiveWorker(task.id)?.id, workerId);
-  assert.deepEqual(store.listWorkers(task.id).map((row) => row.id), [workerId]);
+  assert.deepEqual(
+    store.listWorkers(task.id).map((row) => row.id),
+    [workerId],
+  );
   store.close();
 });
 
