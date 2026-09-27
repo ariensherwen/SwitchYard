@@ -86,6 +86,9 @@ export interface ReviewRecord {
   summary: string | null;
   created_at: string;
   completed_at: string | null;
+  startup_reserved: number;
+  runtime_starting: number;
+  runtime_starter_pid: number | null;
 }
 
 export interface FindingRecord {
@@ -106,7 +109,7 @@ export interface EventRecord {
   created_at: string;
 }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -231,8 +234,22 @@ export class StateStore {
 
   getLatestReview(taskId: string): ReviewRecord | undefined {
     return this.db
-      .prepare("SELECT * FROM reviews WHERE task_id = ? ORDER BY created_at DESC LIMIT 1")
+      .prepare("SELECT * FROM reviews WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
       .get(taskId) as ReviewRecord | undefined;
+  }
+
+  listReviews(taskId: string): ReviewRecord[] {
+    return this.db
+      .prepare("SELECT * FROM reviews WHERE task_id = ? ORDER BY created_at DESC, id DESC")
+      .all(taskId) as unknown as ReviewRecord[];
+  }
+
+  getRunningReviewForCandidate(taskId: string, candidateSha: string): ReviewRecord | undefined {
+    return this.db
+      .prepare(
+        "SELECT * FROM reviews WHERE task_id = ? AND candidate_sha = ? AND state = 'running'",
+      )
+      .get(taskId, candidateSha) as ReviewRecord | undefined;
   }
 
   listFindings(reviewId: string): FindingRecord[] {
@@ -353,6 +370,50 @@ export class StateStore {
             created_at TEXT NOT NULL
           );
           PRAGMA user_version = 1;
+        `);
+      }
+    });
+
+    this.transaction(() => {
+      if (row.user_version <= 1) {
+        this.db.exec(`
+          ALTER TABLE reviews ADD COLUMN startup_reserved INTEGER NOT NULL DEFAULT 0
+            CHECK(startup_reserved IN (0,1));
+          ALTER TABLE reviews ADD COLUMN runtime_starting INTEGER NOT NULL DEFAULT 0
+            CHECK(runtime_starting IN (0,1));
+          ALTER TABLE reviews ADD COLUMN runtime_starter_pid INTEGER;
+        `);
+
+        const activeReviews = this.db
+          .prepare(
+            "SELECT id, task_id, candidate_sha FROM reviews WHERE state='running' ORDER BY created_at DESC, id DESC",
+          )
+          .all() as Array<{ id: string; task_id: string; candidate_sha: string }>;
+        const seenCandidates = new Set<string>();
+        for (const review of activeReviews) {
+          const key = `${review.task_id}:${review.candidate_sha}`;
+          if (!seenCandidates.has(key)) {
+            seenCandidates.add(key);
+            continue;
+          }
+          const failure =
+            "superseded by a newer active Review for the same candidate during migration";
+          this.db
+            .prepare(
+              "UPDATE reviews SET state='failed', summary=?, completed_at=? WHERE id=? AND state='running'",
+            )
+            .run(failure, now(), review.id);
+          this.event(review.task_id, "review.superseded", {
+            review_id: review.id,
+            candidate_sha: review.candidate_sha,
+            failure,
+          });
+        }
+
+        this.db.exec(`
+          CREATE UNIQUE INDEX one_running_review_per_candidate
+            ON reviews(task_id, candidate_sha) WHERE state='running';
+          PRAGMA user_version = 2;
         `);
       }
     });

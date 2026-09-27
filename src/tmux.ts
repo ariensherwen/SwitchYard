@@ -72,8 +72,9 @@ export async function killWindow(window: string): Promise<void> {
 }
 
 export async function attachWindow(window: string): Promise<number> {
-  const target = await findWindowId(window);
-  if (!target) throw new Error(`tmux window not found: ${window}`);
+  const windowId = await findWindowId(window);
+  if (!windowId) throw new Error(`tmux window not found: ${window}`);
+  const target = `${TMUX_SESSION}:${windowId}`;
   if (process.env.TMUX) {
     await tmux(["switch-client", "-t", target]);
     return 0;

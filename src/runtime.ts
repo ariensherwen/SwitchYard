@@ -251,36 +251,102 @@ export async function startReviewer(
 ): Promise<void> {
   const review = store.getReview(reviewId);
   if (review?.state !== "running") throw new Error("review is not running");
-  const task = store.getTask(review.task_id);
-  const workspace = store.getWorkspace(review.task_id);
-  if (!task?.base_sha || !workspace) throw new Error("task/base/workspace not found");
-  const pathsChanged = await changedPaths(workspace.path, task.base_sha, review.candidate_sha);
-  const diff = await diffText(workspace.path, task.base_sha, review.candidate_sha);
-  const prompt = [
-    `You are an independent SwitchYard Reviewer for task ${task.id}.`,
-    "Do not modify files. Review only the exact detached candidate revision in your current directory.",
-    `Original instruction:\n${task.instruction}`,
-    `Worker completion summary:\n${task.summary ?? "(none)"}`,
-    `Worker verification summary:\n${task.verification_summary ?? "(none)"}`,
-    `Candidate SHA: ${review.candidate_sha}`,
-    `Changed paths:\n${pathsChanged.join("\n") || "(none)"}`,
-    `Candidate diff:\n${diff || "(empty diff)"}`,
-    "Submit exactly one structured result with switchyard_submit_review.",
-  ].join("\n\n");
-  const launch = buildPiLaunch(
-    "reviewer",
-    review.path,
-    {
-      SWITCHYARD_HOME: paths.home,
-      SWITCHYARD_TASK_ID: task.id,
-      SWITCHYARD_REVIEW_ID: reviewId,
-    },
-    prompt,
-  );
-  await ensureWindow(review.tmux_window, launch.cwd, shellCommand(launch));
-  if (!(await windowAlive(review.tmux_window)))
-    throw new Error("Reviewer Pi exited during startup");
-  store.event(task.id, "reviewer.started", { review_id: reviewId, window: review.tmux_window });
+  if (review.startup_reserved) throw new Error("Review worktree startup is not complete");
+
+  if (await windowAlive(review.tmux_window)) {
+    if (review.runtime_starting && !processIsAlive(review.runtime_starter_pid)) {
+      clearReviewerStartupClaim(store, reviewId, review.runtime_starter_pid ?? undefined);
+    }
+    return;
+  }
+
+  const claimed = store.transaction(() => {
+    const current = store.getReview(reviewId);
+    if (current?.state !== "running" || current.startup_reserved) return false;
+    if (current.runtime_starting) {
+      if (processIsAlive(current.runtime_starter_pid)) return false;
+      store.db
+        .prepare(
+          "UPDATE reviews SET runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND state='running' AND runtime_starting=1",
+        )
+        .run(reviewId);
+    }
+    const changed = store.db
+      .prepare(
+        `UPDATE reviews SET runtime_starting=1, runtime_starter_pid=?
+         WHERE id=? AND state='running' AND startup_reserved=0 AND runtime_starting=0`,
+      )
+      .run(process.pid, reviewId);
+    return changed.changes === 1;
+  });
+  if (!claimed) return;
+
+  try {
+    const task = store.getTask(review.task_id);
+    const workspace = store.getWorkspace(review.task_id);
+    if (!task?.base_sha || !workspace) throw new Error("task/base/workspace not found");
+    const pathsChanged = await changedPaths(workspace.path, task.base_sha, review.candidate_sha);
+    const diff = await diffText(workspace.path, task.base_sha, review.candidate_sha);
+    const prompt = [
+      `You are an independent SwitchYard Reviewer for task ${task.id}.`,
+      "Do not modify files. Review only the exact detached candidate revision in your current directory.",
+      `Original instruction:\n${task.instruction}`,
+      `Worker completion summary:\n${task.summary ?? "(none)"}`,
+      `Worker verification summary:\n${task.verification_summary ?? "(none)"}`,
+      `Candidate SHA: ${review.candidate_sha}`,
+      `Changed paths:\n${pathsChanged.join("\n") || "(none)"}`,
+      `Candidate diff:\n${diff || "(empty diff)"}`,
+      "Submit exactly one structured result with switchyard_submit_review.",
+    ].join("\n\n");
+    const launch = buildPiLaunch(
+      "reviewer",
+      review.path,
+      {
+        SWITCHYARD_HOME: paths.home,
+        SWITCHYARD_TASK_ID: task.id,
+        SWITCHYARD_REVIEW_ID: reviewId,
+      },
+      prompt,
+    );
+    await ensureWindow(review.tmux_window, launch.cwd, shellCommand(launch));
+    if (!(await windowAlive(review.tmux_window)))
+      throw new Error("Reviewer Pi exited during startup");
+    store.transaction(() => {
+      store.db
+        .prepare(
+          "UPDATE reviews SET runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND runtime_starting=1 AND runtime_starter_pid=?",
+        )
+        .run(reviewId, process.pid);
+      store.event(task.id, "reviewer.started", { review_id: reviewId, window: review.tmux_window });
+    });
+  } catch (error) {
+    clearReviewerStartupClaim(store, reviewId);
+    throw error;
+  }
+}
+
+function clearReviewerStartupClaim(
+  store: StateStore,
+  reviewId: string,
+  ownerPid = process.pid,
+): void {
+  store.transaction(() => {
+    store.db
+      .prepare(
+        "UPDATE reviews SET runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND runtime_starting=1 AND runtime_starter_pid=?",
+      )
+      .run(reviewId, ownerPid);
+  });
+}
+
+function processIsAlive(pid: number | null): boolean {
+  if (pid === null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function buildWorkerDispatchContext(

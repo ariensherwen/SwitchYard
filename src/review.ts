@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type { SwitchYardPaths } from "./home.ts";
 import { enqueueMessage } from "./inbox.ts";
@@ -35,20 +36,47 @@ export async function beginReview(
   const task = store.getTask(taskId);
   if (task?.state !== "reviewing" || !task.candidate_sha)
     throw new Error("task is not ready for review");
+  const candidateSha = task.candidate_sha;
   const project = store.getProject(task.project_id);
   if (!project) throw new Error("project not found");
   const id = randomUUID();
   const reviewPath = path.join(paths.reviews, taskId, id);
   const tmuxWindow = `review-${taskId}-${id}`;
-  await createReviewWorktree(project.root_path, reviewPath, task.candidate_sha);
-  store.transaction(() => {
+  const review = store.transaction(() => {
+    const currentTask = store.getTask(taskId);
+    if (currentTask?.state !== "reviewing" || currentTask.candidate_sha !== candidateSha)
+      throw new Error("task is no longer ready for this review");
+    const current = store.getRunningReviewForCandidate(taskId, candidateSha);
+    if (current) return current;
     store.db
-      .prepare(`INSERT INTO reviews(id, task_id, candidate_sha, state, attempts, tmux_window, path, created_at)
-      VALUES (?, ?, ?, 'running', 1, ?, ?, ?)`)
-      .run(id, taskId, task.candidate_sha, tmuxWindow, reviewPath, now());
-    store.event(taskId, "review.started", { review_id: id, candidate_sha: task.candidate_sha });
+      .prepare(`INSERT INTO reviews(
+        id, task_id, candidate_sha, state, attempts, tmux_window, path, created_at,
+        startup_reserved, runtime_starting, runtime_starter_pid
+      ) VALUES (?, ?, ?, 'running', 1, ?, ?, ?, 1, 0, NULL)`)
+      .run(id, taskId, candidateSha, tmuxWindow, reviewPath, now());
+    store.event(taskId, "review.reserved", { review_id: id, candidate_sha: candidateSha });
+    const reserved = store.getReview(id);
+    if (!reserved) throw new Error("failed to reserve Review identity");
+    return reserved;
   });
-  return id;
+
+  if (review.startup_reserved || !existsSync(review.path)) {
+    await ensureReviewWorktree(project.root_path, review.path, review.candidate_sha);
+    store.transaction(() => {
+      const changed = store.db
+        .prepare(
+          "UPDATE reviews SET startup_reserved=0 WHERE id=? AND state='running' AND startup_reserved=1",
+        )
+        .run(review.id);
+      if (changed.changes === 1) {
+        store.event(taskId, "review.started", {
+          review_id: review.id,
+          candidate_sha: review.candidate_sha,
+        });
+      }
+    });
+  }
+  return review.id;
 }
 
 export async function submitReview(
@@ -90,7 +118,8 @@ export async function submitReview(
     const state = submission.verdict === "clean" ? "clean" : "changes_requested";
     const updated = store.db
       .prepare(
-        "UPDATE reviews SET state=?, summary=?, completed_at=? WHERE id=? AND state='running'",
+        `UPDATE reviews SET state=?, summary=?, completed_at=?, startup_reserved=0,
+          runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND state='running'`,
       )
       .run(state, submission.summary, now(), reviewId);
     if (updated.changes !== 1) throw new Error("review changed concurrently");
@@ -151,11 +180,16 @@ export function recordReviewRuntimeFailure(
 ): "retry" | "decision" {
   const review = store.getReview(reviewId);
   if (review?.state !== "running") throw new Error("running review not found");
+  if (review.runtime_starting && processIsAlive(review.runtime_starter_pid)) return "retry";
   if (review.attempts < 3) {
     store.transaction(() => {
-      store.db
-        .prepare("UPDATE reviews SET attempts=attempts+1 WHERE id=? AND state='running'")
+      const changed = store.db
+        .prepare(
+          `UPDATE reviews SET attempts=attempts+1, runtime_starting=0,
+            runtime_starter_pid=NULL WHERE id=? AND state='running'`,
+        )
         .run(reviewId);
+      if (changed.changes !== 1) throw new Error("running review changed concurrently");
       store.event(review.task_id, "review.retry", {
         review_id: reviewId,
         failure,
@@ -166,11 +200,13 @@ export function recordReviewRuntimeFailure(
   }
   const decisionId = randomUUID();
   store.transaction(() => {
-    store.db
+    const changed = store.db
       .prepare(
-        "UPDATE reviews SET state='failed', summary=?, completed_at=? WHERE id=? AND state='running'",
+        `UPDATE reviews SET state='failed', summary=?, completed_at=?, runtime_starting=0,
+          runtime_starter_pid=NULL WHERE id=? AND state='running'`,
       )
       .run(failure, now(), reviewId);
+    if (changed.changes !== 1) throw new Error("running review changed concurrently");
     casTransition(store, review.task_id, "reviewing", "needs_decision");
     store.db
       .prepare(`INSERT INTO decisions(id, task_id, question, context, state, created_at)
@@ -192,4 +228,36 @@ export function recordReviewRuntimeFailure(
     );
   });
   return "decision";
+}
+
+async function ensureReviewWorktree(
+  projectRoot: string,
+  reviewPath: string,
+  candidateSha: string,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      if (existsSync(reviewPath)) {
+        await validateReviewCheckout(reviewPath, candidateSha);
+      } else {
+        await createReviewWorktree(projectRoot, reviewPath, candidateSha);
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function processIsAlive(pid: number | null): boolean {
+  if (pid === null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }

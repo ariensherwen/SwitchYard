@@ -91,6 +91,7 @@ export function resumeWaiting(store: StateStore, taskId: string, message?: strin
 export function steerTask(store: StateStore, taskId: string, message: string): TaskRecord {
   const task = requiredTask(store, taskId);
   if (TERMINAL.has(task.state)) throw new Error("cannot steer a terminal task");
+  if (task.state === "reviewing") throw new Error("cannot steer a task while it is under review");
   if (task.state === "waiting") return resumeWaiting(store, taskId, message);
   enqueueMessage(store, taskId, "worker", message);
   return requiredTask(store, taskId);

@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage } from "../src/inbox.ts";
-import { resumeReservedWorker, startWorker } from "../src/runtime.ts";
+import { beginReview } from "../src/review.ts";
+import { resumeReservedWorker, startReviewer, startWorker } from "../src/runtime.ts";
 import { now, StateStore } from "../src/state.ts";
-import { createTask, startTask } from "../src/tasks.ts";
+import { createTask, markRunning, startTask, submitCandidate } from "../src/tasks.ts";
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
@@ -41,15 +42,16 @@ async function fixture() {
 
   const bin = path.join(root, "bin");
   const stateFile = path.join(root, "fake-tmux-state");
+  const failureFile = path.join(root, "fake-tmux-failure");
   await mkdir(bin);
   const tmux = path.join(bin, "tmux");
   await writeFile(
     tmux,
-    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(stateFile)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) while IFS= read -r name; do printf '@1\\t%s\\n' "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) : ;;\n  *) : ;;\nesac\n`,
+    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(stateFile)}\nfailure=${JSON.stringify(failureFile)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window)\n    if [[ -f "$failure" ]]; then IFS= read -r failed < "$failure"; [[ "$6" != "$failed" ]] || exit 1; fi\n    printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) while IFS= read -r name; do printf '@1\\t%s\\n' "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) : ;;\n  *) : ;;\nesac\n`,
   );
   await chmod(tmux, 0o755);
   process.env.PATH = `${bin}:${originalPath}`;
-  return { paths, store };
+  return { paths, store, stateFile, failureFile };
 }
 
 test("Worker identity is durable and original instruction is queued before runtime activation", async () => {
@@ -110,5 +112,62 @@ test("terminal reconciliation retires lingering Worker authority", async () => {
 
   assert.equal(store.getActiveWorker(task.id), undefined);
   assert.equal(store.listWorkers(task.id).find((row) => row.id === workerId)?.state, "stopped");
+  store.close();
+});
+
+test("one Task recovery failure is recorded without blocking later Tasks", async () => {
+  const { paths, store, failureFile } = await fixture();
+  const laterTask = createTask(store, "p", "implement", "recover later", "off");
+  const brokenTask = createTask(store, "p", "implement", "fail recovery", "off");
+  await startTask(store, paths, laterTask.id);
+  await startTask(store, paths, brokenTask.id);
+  store.db
+    .prepare("UPDATE tasks SET created_at=? WHERE id=?")
+    .run("2030-01-02T00:00:00.000Z", brokenTask.id);
+  store.db
+    .prepare("UPDATE tasks SET created_at=? WHERE id=?")
+    .run("2030-01-01T00:00:00.000Z", laterTask.id);
+  await writeFile(failureFile, `task-${brokenTask.id}\n`);
+  const { reconcile } = await import("../src/reconcile.ts");
+
+  await reconcile(store, paths);
+
+  assert.equal(store.getTask(brokenTask.id)?.state, "failed");
+  assert.match(store.getTask(brokenTask.id)?.failure ?? "", /recovery failed/);
+  assert.ok(store.listEvents(brokenTask.id).some((event) => event.type === "task.recovery_failed"));
+  assert.equal(store.getTask(laterTask.id)?.state, "running");
+  assert.ok(store.getActiveWorker(laterTask.id));
+  store.close();
+});
+
+test("concurrent Reviewer launches share one durable startup owner", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "review this change", "loop");
+  await startTask(store, paths, task.id);
+  markRunning(store, task.id);
+  const workspace = store.getWorkspace(task.id);
+  assert.ok(workspace);
+  await writeFile(path.join(workspace.path, "README.md"), "candidate\n");
+  await exec("git", ["add", "README.md"], { cwd: workspace.path });
+  await exec("git", ["commit", "-m", "candidate"], { cwd: workspace.path });
+  await submitCandidate(store, task.id, "candidate", "verified");
+  const reviewId = await beginReview(store, paths, task.id);
+  const secondStore = new StateStore(paths.database);
+
+  await Promise.all([
+    startReviewer(store, paths, reviewId),
+    startReviewer(secondStore, paths, reviewId),
+  ]);
+
+  const review = store.getReview(reviewId);
+  assert.ok(review);
+  assert.equal(review.runtime_starting, 0);
+  assert.equal(review.runtime_starter_pid, null);
+  assert.equal((await readFile(stateFile, "utf8")).trim().split(/\r?\n/).length, 1);
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "reviewer.started").length,
+    1,
+  );
+  secondStore.close();
   store.close();
 });

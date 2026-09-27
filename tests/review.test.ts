@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { getSwitchYardPaths } from "../src/home.ts";
 import { beginReview, submitReview } from "../src/review.ts";
 import { StateStore } from "../src/state.ts";
-import { createTask, submitCandidate } from "../src/tasks.ts";
+import { createTask, steerTask, submitCandidate } from "../src/tasks.ts";
 import { createWorkspace } from "../src/worktree.ts";
 
 const exec = promisify(execFile);
@@ -58,6 +58,26 @@ async function fixture() {
   return { store, paths, taskId: task.id, workspace: ws.path };
 }
 
+test("concurrent Review startup shares one durable reservation", async () => {
+  const { store, paths, taskId } = await fixture();
+  const reviewIds = await Promise.all([
+    beginReview(store, paths, taskId),
+    beginReview(store, paths, taskId),
+  ]);
+
+  assert.equal(reviewIds[0], reviewIds[1]);
+  const reviews = store.db
+    .prepare("SELECT * FROM reviews WHERE task_id=? AND state='running'")
+    .all(taskId);
+  assert.equal(reviews.length, 1);
+  assert.equal(store.getReview(reviewIds[0] ?? "")?.startup_reserved, 0);
+  assert.equal(
+    store.listEvents(taskId).filter((event) => event.type === "review.reserved").length,
+    1,
+  );
+  store.close();
+});
+
 test("clean review certifies exact candidate and completes task", async () => {
   const { store, paths, taskId } = await fixture();
   const reviewId = await beginReview(store, paths, taskId);
@@ -69,6 +89,24 @@ test("clean review certifies exact candidate and completes task", async () => {
   });
   assert.equal(store.getTask(taskId)?.state, "completed");
   assert.equal(store.getReview(reviewId)?.state, "clean");
+  store.close();
+});
+
+test("steering is rejected during review and cannot be lost on clean completion", async () => {
+  const { store, paths, taskId } = await fixture();
+  const reviewId = await beginReview(store, paths, taskId);
+
+  assert.throws(() => steerTask(store, taskId, "please change the design"), /under review/);
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
+
+  await submitReview(store, reviewId, {
+    verdict: "clean",
+    summary: "clean",
+    reviewed_paths: ["a.txt"],
+    findings: [],
+  });
+  assert.equal(store.getTask(taskId)?.state, "completed");
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
   store.close();
 });
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 import { StateStore } from "../src/state.ts";
 import { cancelTask, createTask, transition } from "../src/tasks.ts";
@@ -32,9 +33,62 @@ test("migrations are repeatable and durable", async () => {
   assert.equal(reopened.listTasks().length, 1);
   assert.equal(
     (reopened.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-    1,
+    2,
   );
   reopened.close();
+});
+
+test("schema migration reserves one active Review per candidate", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "switchyard-state-v1-"));
+  dirs.push(dir);
+  const dbPath = path.join(dir, "switchyard.db");
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE reviews (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      candidate_sha TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('running','changes_requested','clean','failed')),
+      attempts INTEGER NOT NULL DEFAULT 1,
+      tmux_window TEXT NOT NULL,
+      path TEXT NOT NULL,
+      summary TEXT,
+      created_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT,
+      type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    PRAGMA user_version = 1;
+  `);
+  legacy
+    .prepare(`INSERT INTO reviews(id, task_id, candidate_sha, state, tmux_window, path, created_at)
+      VALUES (?, 'task', 'sha', 'running', ?, ?, ?)`)
+    .run("old-review", "old-window", "/old", "2025-01-01T00:00:00.000Z");
+  legacy
+    .prepare(`INSERT INTO reviews(id, task_id, candidate_sha, state, tmux_window, path, created_at)
+      VALUES (?, 'task', 'sha', 'running', ?, ?, ?)`)
+    .run("new-review", "new-window", "/new", "2025-01-02T00:00:00.000Z");
+  legacy.close();
+
+  const store = new StateStore(dbPath);
+  assert.equal(store.getReview("old-review")?.state, "failed");
+  assert.equal(store.getReview("new-review")?.state, "running");
+  assert.equal(store.listEvents("task")[0]?.type, "review.superseded");
+  assert.throws(
+    () =>
+      store.db
+        .prepare(`INSERT INTO reviews(
+          id, task_id, candidate_sha, state, attempts, tmux_window, path, created_at
+        ) VALUES ('duplicate', 'task', 'sha', 'running', 1, 'duplicate', '/duplicate', '2025')`)
+        .run(),
+    /UNIQUE constraint failed/,
+  );
+  store.close();
 });
 
 test("canonical task transitions reject illegal resurrection", async () => {
