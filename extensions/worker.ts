@@ -4,7 +4,7 @@ import { beginReview } from "../src/review.ts";
 import { retireWorker, startReviewer, wakeSupervisor } from "../src/runtime.ts";
 import type { StateStore, TaskState } from "../src/state.ts";
 import { markWaiting, requestDecision, submitCandidate } from "../src/tasks.ts";
-import type { PiExtensionApi, PiExtensionContext } from "./pi-types.ts";
+import type { PiExtensionApi } from "./pi-types.ts";
 import { objectSchema, stringArraySchema, stringSchema } from "./schema.ts";
 
 interface CompleteParams {

@@ -62,7 +62,9 @@ test("Worker identity is durable and original instruction is queued before runti
   assert.equal(store.getActiveWorker(task.id)?.id, workerId);
   const messages = store.listPendingMessages(task.id, "worker");
   assert.equal(messages.length, 1);
-  assert.match(messages[0]!.text, /Instruction:\nImplement the requested feature/);
+  const initialMessage = messages[0];
+  assert.ok(initialMessage);
+  assert.match(initialMessage.text, /Instruction:\nImplement the requested feature/);
   store.close();
 });
 
@@ -83,7 +85,8 @@ test("recovery launches the exact reserved Worker identity after crash-before-sp
     "Start this SwitchYard Task.\n\nInstruction:\nResume me",
   );
 
-  const worker = store.getLiveWorker(task.id)!;
+  const worker = store.getLiveWorker(task.id);
+  assert.ok(worker);
   await resumeReservedWorker(store, paths, worker);
 
   assert.equal(store.getTask(task.id)?.state, "running");

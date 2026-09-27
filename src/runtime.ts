@@ -16,7 +16,7 @@ export async function startWorker(
 ): Promise<string> {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
-  if (!task || task.state !== "starting" || !workspace) {
+  if (task?.state !== "starting" || !workspace) {
     throw new Error("task is not ready to start a worker");
   }
 
@@ -49,7 +49,7 @@ export async function replaceWorker(
 ): Promise<string> {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
-  if (!task || task.state !== "running" || !workspace) {
+  if (task?.state !== "running" || !workspace) {
     throw new Error("task is not ready for a replacement Worker");
   }
 
@@ -191,7 +191,7 @@ export function retireWorker(
 
 export async function stopReviewer(store: StateStore, taskId: string): Promise<void> {
   const review = store.getLatestReview(taskId);
-  if (!review || review.state !== "running") return;
+  if (review?.state !== "running") return;
   await killWindow(review.tmux_window);
   store.event(taskId, "reviewer.stopped", { review_id: review.id });
 }
@@ -250,10 +250,10 @@ export async function startReviewer(
   reviewId: string,
 ): Promise<void> {
   const review = store.getReview(reviewId);
-  if (!review || review.state !== "running") throw new Error("review is not running");
+  if (review?.state !== "running") throw new Error("review is not running");
   const task = store.getTask(review.task_id);
   const workspace = store.getWorkspace(review.task_id);
-  if (!task || !task.base_sha || !workspace) throw new Error("task/base/workspace not found");
+  if (!task?.base_sha || !workspace) throw new Error("task/base/workspace not found");
   const pathsChanged = await changedPaths(workspace.path, task.base_sha, review.candidate_sha);
   const diff = await diffText(workspace.path, task.base_sha, review.candidate_sha);
   const prompt = [

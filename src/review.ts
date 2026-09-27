@@ -33,7 +33,7 @@ export async function beginReview(
   taskId: string,
 ): Promise<string> {
   const task = store.getTask(taskId);
-  if (!task || task.state !== "reviewing" || !task.candidate_sha)
+  if (task?.state !== "reviewing" || !task.candidate_sha)
     throw new Error("task is not ready for review");
   const project = store.getProject(task.project_id);
   if (!project) throw new Error("project not found");
@@ -57,9 +57,9 @@ export async function submitReview(
   submission: ReviewSubmission,
 ): Promise<void> {
   const review = store.getReview(reviewId);
-  if (!review || review.state !== "running") throw new Error("running review not found");
+  if (review?.state !== "running") throw new Error("running review not found");
   const task = store.getTask(review.task_id);
-  if (!task || task.state !== "reviewing") throw new Error("task is not currently reviewing");
+  if (task?.state !== "reviewing") throw new Error("task is not currently reviewing");
   if (task.candidate_sha !== review.candidate_sha)
     throw new Error("stale review certification: task candidate changed");
   if (submission.verdict === "clean" && submission.findings.length !== 0)
@@ -150,7 +150,7 @@ export function recordReviewRuntimeFailure(
   failure: string,
 ): "retry" | "decision" {
   const review = store.getReview(reviewId);
-  if (!review || review.state !== "running") throw new Error("running review not found");
+  if (review?.state !== "running") throw new Error("running review not found");
   if (review.attempts < 3) {
     store.transaction(() => {
       store.db

@@ -135,7 +135,8 @@ test("clean certification is stale if Worker Workspace advances", async () => {
 test("modified review checkout cannot certify clean", async () => {
   const { store, paths, taskId } = await fixture();
   const reviewId = await beginReview(store, paths, taskId);
-  const review = store.getReview(reviewId)!;
+  const review = store.getReview(reviewId);
+  assert.ok(review);
   await writeFile(path.join(review.path, "scratch.txt"), "modified\n");
   await assert.rejects(
     () =>

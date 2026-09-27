@@ -23,7 +23,9 @@ async function fixture() {
 
 test("migrations are repeatable and durable", async () => {
   const store = await fixture();
-  const dbPath = path.join(dirs[dirs.length - 1]!, "switchyard.db");
+  const fixtureDir = dirs.at(-1);
+  assert.ok(fixtureDir);
+  const dbPath = path.join(fixtureDir, "switchyard.db");
   createTask(store, "p", "implement", "change x", "off");
   store.close();
   const reopened = new StateStore(dbPath);

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
+import type { PiExtensionApi, PiLifecycleEvent, PiToolDefinition } from "../extensions/pi-types.ts";
 import supervisorExtension from "../extensions/supervisor.ts";
 import workerExtension from "../extensions/worker.ts";
 import { ensureSwitchYardHome } from "../src/home.ts";
@@ -49,26 +50,29 @@ async function fixture(state: "running" | "waiting" = "running") {
 }
 
 function fakePi() {
-  const tools = new Map<string, any>();
-  const handlers = new Map<string, any>();
+  const tools = new Map<string, unknown>();
+  const handlers = new Map<PiLifecycleEvent, Parameters<PiExtensionApi["on"]>[1]>();
   const messages: Array<{ text: string; options: unknown }> = [];
   const activeTools: string[][] = [];
+  const api: PiExtensionApi = {
+    registerTool<TParams>(tool: PiToolDefinition<TParams>) {
+      tools.set(tool.name, tool);
+    },
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+    async sendUserMessage(text, options) {
+      messages.push({ text, options });
+    },
+    setActiveTools(names) {
+      activeTools.push([...names]);
+    },
+  };
   return {
-    api: {
-      registerTool(tool: any) {
-        tools.set(tool.name, tool);
-      },
-      on(event: string, handler: any) {
-        handlers.set(event, handler);
-      },
-      async sendUserMessage(text: string, options: unknown) {
-        messages.push({ text, options });
-      },
-      setActiveTools(names: string[]) {
-        activeTools.push([...names]);
-      },
-    } as any,
-    tools,
+    api,
+    getTool<TParams>(name: string) {
+      return tools.get(name) as PiToolDefinition<TParams> | undefined;
+    },
     handlers,
     messages,
     activeTools,
@@ -94,14 +98,20 @@ test("idle Worker receives durable startup and wake-driven steering as Pi user m
 
   await fake.handlers.get("session_start")?.();
   assert.equal(fake.messages.length, 1);
-  assert.match(fake.messages[0]!.text, /Original Task instruction/);
-  assert.deepEqual(fake.messages[0]!.options, { deliverAs: "steer" });
-  assert.ok(fake.activeTools.at(-1)!.includes("bash"));
+  const initialMessage = fake.messages[0];
+  assert.ok(initialMessage);
+  assert.match(initialMessage.text, /Original Task instruction/);
+  assert.deepEqual(initialMessage.options, { deliverAs: "steer" });
+  const enabledTools = fake.activeTools.at(-1);
+  assert.ok(enabledTools);
+  assert.ok(enabledTools.includes("bash"));
 
   enqueueMessage(store, taskId, "worker", "Steer the idle Worker");
   await signalWake(paths.wake, `worker-${workerId}.wake`);
   await waitFor(() => fake.messages.length === 2);
-  assert.match(fake.messages[1]!.text, /Steer the idle Worker/);
+  const steeringMessage = fake.messages[1];
+  assert.ok(steeringMessage);
+  assert.match(steeringMessage.text, /Steer the idle Worker/);
   assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
 
   await fake.handlers.get("session_shutdown")?.();
@@ -112,7 +122,7 @@ test("Supervisor steering resumes a waiting Task through the shared domain opera
   const { store, taskId } = await fixture("waiting");
   const fake = fakePi();
   supervisorExtension(fake.api);
-  const tool = fake.tools.get("switchyard_send_message");
+  const tool = fake.getTool<{ task_id: string; text: string }>("switchyard_send_message");
   assert.ok(tool);
 
   await tool.execute("call", { task_id: taskId, text: "Resume with this guidance" });
@@ -133,7 +143,8 @@ test("Supervisor and Reviewer authority is mechanically allowlisted", async () =
   dirs.push(root);
   process.env.SWITCHYARD_HOME = path.join(root, "home");
   await supervisor.handlers.get("session_start")?.();
-  const active = supervisor.activeTools.at(-1)!;
+  const active = supervisor.activeTools.at(-1);
+  assert.ok(active);
   assert.deepEqual(
     active.sort(),
     [
