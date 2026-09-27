@@ -5,7 +5,8 @@ import { enqueueMessage } from "./inbox.ts";
 import type { ReviewPolicy, StateStore, TaskKind, TaskRecord, TaskState } from "./state.ts";
 import { now } from "./state.ts";
 import {
-  createWorkspace,
+  ensureTaskWorkspace,
+  taskWorkspaceBase,
   validateImplementCandidate,
   validateInvestigateCompletion,
 } from "./worktree.ts";
@@ -44,32 +45,89 @@ export function createTask(
   return requiredTask(store, id);
 }
 
+export interface TaskStartupHooks {
+  afterReservation?: () => void | Promise<void>;
+  afterWorktreeProvisioned?: () => void | Promise<void>;
+}
+
 export async function startTask(
   store: StateStore,
   paths: SwitchYardPaths,
   taskId: string,
+  hooks: TaskStartupHooks = {},
 ): Promise<TaskRecord> {
   const task = requiredTask(store, taskId);
   const project = store.getProject(task.project_id);
   if (!project) throw new Error(`project not found: ${task.project_id}`);
-  transition(store, taskId, "queued", "starting", "task.starting");
   const workspacePath = path.join(paths.worktrees, project.id, taskId);
   const branch = `switchyard/task-${taskId}`;
-  try {
-    const workspace = await createWorkspace(project.root_path, workspacePath, branch);
+  let workspace = store.getWorkspace(taskId);
+  let reserved = false;
+
+  if (task.state === "queued") {
+    const baseSha = await taskWorkspaceBase(project.root_path, workspacePath, branch);
     store.transaction(() => {
-      store.db
-        .prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
-        .run(taskId, workspace.path, workspace.branch, now());
+      casTransition(store, taskId, "queued", "starting");
+      if (!workspace) {
+        store.db
+          .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
+            VALUES (?, ?, ?, 0, ?)`)
+          .run(taskId, workspacePath, branch, now());
+        store.event(taskId, "workspace.reserved", {
+          path: workspacePath,
+          branch,
+          base_sha: baseSha,
+        });
+      }
       store.db
         .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
-        .run(workspace.baseSha, now(), taskId);
+        .run(baseSha, now(), taskId);
+      store.event(taskId, "task.starting");
     });
-    return requiredTask(store, taskId);
-  } catch (error) {
-    failTask(store, taskId, error instanceof Error ? error.message : String(error));
-    throw error;
+    workspace = store.getWorkspace(taskId);
+    reserved = true;
+  } else if (task.state === "starting" && !workspace) {
+    const baseSha =
+      task.base_sha ?? (await taskWorkspaceBase(project.root_path, workspacePath, branch));
+    store.transaction(() => {
+      const current = requiredTask(store, taskId);
+      if (current.state !== "starting")
+        throw new Error(`task is ${current.state}, expected starting`);
+      store.db
+        .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
+          VALUES (?, ?, ?, 0, ?)`)
+        .run(taskId, workspacePath, branch, now());
+      store.db
+        .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
+        .run(baseSha, now(), taskId);
+      store.event(taskId, "workspace.reserved", {
+        path: workspacePath,
+        branch,
+        base_sha: baseSha,
+        recovered: true,
+      });
+    });
+    workspace = store.getWorkspace(taskId);
+    reserved = true;
+  } else if (task.state !== "starting") {
+    throw new Error(`task ${taskId} is ${task.state}, expected queued or starting`);
   }
+
+  if (!workspace) throw new Error("task workspace reservation is missing");
+  if (reserved) await hooks.afterReservation?.();
+  if (workspace.provisioned === 0) {
+    const baseSha = store.getTask(taskId)?.base_sha;
+    if (!baseSha) throw new Error("task workspace base revision is missing");
+    await ensureTaskWorkspace(project.root_path, workspace.path, workspace.branch, baseSha);
+    await hooks.afterWorktreeProvisioned?.();
+    store.transaction(() => {
+      const changed = store.db
+        .prepare("UPDATE workspaces SET provisioned=1 WHERE task_id=? AND provisioned=0")
+        .run(taskId);
+      if (changed.changes === 1) store.event(taskId, "workspace.provisioned", { branch });
+    });
+  }
+  return requiredTask(store, taskId);
 }
 
 export function markRunning(store: StateStore, taskId: string): TaskRecord {
@@ -77,15 +135,22 @@ export function markRunning(store: StateStore, taskId: string): TaskRecord {
 }
 
 export function markWaiting(store: StateStore, taskId: string, reason: string): TaskRecord {
-  const result = transition(store, taskId, "running", "waiting", "task.waiting", { reason });
-  enqueueMessage(store, taskId, "supervisor", `Task ${taskId} is waiting: ${reason}`);
-  return result;
+  store.transaction(() => {
+    casTransition(store, taskId, "running", "waiting");
+    store.event(taskId, "task.waiting", { reason });
+    enqueueMessage(store, taskId, "supervisor", `Task ${taskId} is waiting: ${reason}`);
+  });
+  return requiredTask(store, taskId);
 }
 
-export function resumeWaiting(store: StateStore, taskId: string, message?: string): TaskRecord {
-  const result = transition(store, taskId, "waiting", "running", "task.resumed");
-  if (message) enqueueMessage(store, taskId, "worker", message);
-  return result;
+export function resumeWaiting(store: StateStore, taskId: string, message: string): TaskRecord {
+  if (!message.trim()) throw new Error("steering message is required");
+  store.transaction(() => {
+    casTransition(store, taskId, "waiting", "running");
+    store.event(taskId, "task.resumed");
+    enqueueMessage(store, taskId, "worker", message);
+  });
+  return requiredTask(store, taskId);
 }
 
 export function steerTask(store: StateStore, taskId: string, message: string): TaskRecord {
@@ -257,6 +322,27 @@ export function casTransition(
   if (result.changes !== 1) {
     const current = store.getTask(taskId)?.state ?? "missing";
     throw new Error(`stale task transition ${from} -> ${to}; current state is ${current}`);
+  }
+  if (to === "completed" || to === "failed" || to === "cancelled") {
+    terminateActiveReviews(store, taskId, to);
+  }
+}
+
+export function terminateActiveReviews(
+  store: StateStore,
+  taskId: string,
+  terminalState: Extract<TaskState, "completed" | "failed" | "cancelled">,
+): void {
+  const reviews = store.db
+    .prepare("SELECT id FROM reviews WHERE task_id=? AND state='running'")
+    .all(taskId) as Array<{ id: string }>;
+  const update = store.db.prepare(`UPDATE reviews SET state='failed', summary=?, completed_at=?,
+    startup_reserved=0, runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND state='running'`);
+  for (const review of reviews) {
+    const reason = `Review aborted because Task became ${terminalState}`;
+    if (update.run(reason, now(), review.id).changes === 1) {
+      store.event(taskId, "review.aborted", { review_id: review.id, task_state: terminalState });
+    }
   }
 }
 

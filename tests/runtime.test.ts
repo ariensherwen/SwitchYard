@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,9 +9,22 @@ import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage } from "../src/inbox.ts";
 import { beginReview } from "../src/review.ts";
-import { resumeReservedWorker, startReviewer, startWorker } from "../src/runtime.ts";
+import {
+  quiesceTaskRuntimes,
+  resumeReservedWorker,
+  startReviewer,
+  startWorker,
+} from "../src/runtime.ts";
 import { now, StateStore } from "../src/state.ts";
-import { createTask, markRunning, startTask, submitCandidate } from "../src/tasks.ts";
+import {
+  cancelTask,
+  createTask,
+  failTask,
+  markRunning,
+  startTask,
+  submitCandidate,
+} from "../src/tasks.ts";
+import { windowAlive } from "../src/tmux.ts";
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
@@ -47,12 +61,88 @@ async function fixture() {
   const tmux = path.join(bin, "tmux");
   await writeFile(
     tmux,
-    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(stateFile)}\nfailure=${JSON.stringify(failureFile)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window)\n    if [[ -f "$failure" ]]; then IFS= read -r failed < "$failure"; [[ "$6" != "$failed" ]] || exit 1; fi\n    printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) while IFS= read -r name; do printf '@1\\t%s\\n' "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) : ;;\n  *) : ;;\nesac\n`,
+    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(stateFile)}\nfailure=${JSON.stringify(failureFile)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window)\n    if [[ -f "$failure" ]]; then IFS= read -r failed < "$failure"; [[ "$6" != "$failed" ]] || exit 1; fi\n    printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) i=0; while IFS= read -r name; do i=$((i+1)); printf '@%s\\t%s\\n' "$i" "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) target="\${3#@}"; temp="$state.tmp"; awk -v target="$target" 'NR != target' "$state" > "$temp"; mv "$temp" "$state" ;;\n  *) : ;;\nesac\n`,
   );
   await chmod(tmux, 0o755);
   process.env.PATH = `${bin}:${originalPath}`;
   return { paths, store, stateFile, failureFile };
 }
+
+test("recovery starts a Task left queued by a crash after creation", async () => {
+  const { paths, store } = await fixture();
+  const task = createTask(store, "p", "implement", "queued recovery", "off");
+  const { reconcile } = await import("../src/reconcile.ts");
+
+  await reconcile(store, paths);
+
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.equal(store.getWorkspace(task.id)?.provisioned, 1);
+  assert.ok(store.getActiveWorker(task.id));
+  assert.ok(store.listEvents(task.id).some((event) => event.type === "workspace.reserved"));
+  store.close();
+});
+
+test("recovery provisions a reserved Workspace after a crash before git worktree add", async () => {
+  const { paths, store } = await fixture();
+  const task = createTask(store, "p", "implement", "reserved recovery", "off");
+  await assert.rejects(
+    () =>
+      startTask(store, paths, task.id, {
+        afterReservation: () => {
+          throw new Error("injected crash");
+        },
+      }),
+    /injected crash/,
+  );
+  const reservation = store.getWorkspace(task.id);
+  assert.equal(store.getTask(task.id)?.state, "starting");
+  assert.equal(reservation?.provisioned, 0);
+  assert.equal(reservation ? existsSync(reservation.path) : true, false);
+  store.close();
+
+  const recovered = new StateStore(paths.database);
+  const { reconcile } = await import("../src/reconcile.ts");
+  await reconcile(recovered, paths);
+
+  assert.equal(recovered.getTask(task.id)?.state, "running");
+  assert.equal(recovered.getWorkspace(task.id)?.provisioned, 1);
+  assert.ok(recovered.getActiveWorker(task.id));
+  recovered.close();
+});
+
+test("recovery adopts a created Workspace after a crash before readiness persistence", async () => {
+  const { paths, store } = await fixture();
+  const task = createTask(store, "p", "implement", "created worktree recovery", "off");
+  await assert.rejects(
+    () =>
+      startTask(store, paths, task.id, {
+        afterWorktreeProvisioned: () => {
+          throw new Error("injected crash");
+        },
+      }),
+    /injected crash/,
+  );
+  const reservation = store.getWorkspace(task.id);
+  assert.equal(store.getTask(task.id)?.state, "starting");
+  assert.equal(reservation?.provisioned, 0);
+  assert.equal(reservation ? existsSync(reservation.path) : false, true);
+  store.close();
+
+  const recovered = new StateStore(paths.database);
+  const { reconcile } = await import("../src/reconcile.ts");
+  await reconcile(recovered, paths);
+
+  assert.equal(recovered.getTask(task.id)?.state, "running");
+  assert.equal(recovered.getWorkspace(task.id)?.provisioned, 1);
+  assert.ok(recovered.getActiveWorker(task.id));
+  const worktrees = (
+    await exec("git", ["worktree", "list", "--porcelain"], {
+      cwd: path.join(path.dirname(paths.home), "repo"),
+    })
+  ).stdout;
+  assert.equal(worktrees.match(/worktree /g)?.length, 2);
+  recovered.close();
+});
 
 test("Worker identity is durable and original instruction is queued before runtime activation", async () => {
   const { paths, store } = await fixture();
@@ -138,6 +228,41 @@ test("one Task recovery failure is recorded without blocking later Tasks", async
   assert.equal(store.getTask(laterTask.id)?.state, "running");
   assert.ok(store.getActiveWorker(laterTask.id));
   store.close();
+});
+
+test("cancelling or failing during review aborts the Review and removes its worktree", async (t) => {
+  for (const terminal of ["cancelled", "failed"] as const) {
+    await t.test(terminal, async () => {
+      const { paths, store } = await fixture();
+      const task = createTask(store, "p", "implement", `terminate review ${terminal}`, "loop");
+      await startTask(store, paths, task.id);
+      markRunning(store, task.id);
+      const workspace = store.getWorkspace(task.id);
+      assert.ok(workspace);
+      await writeFile(path.join(workspace.path, "README.md"), "candidate\n");
+      await exec("git", ["add", "README.md"], { cwd: workspace.path });
+      await exec("git", ["commit", "-m", "candidate"], { cwd: workspace.path });
+      await submitCandidate(store, task.id, "candidate", "verified");
+      const reviewId = await beginReview(store, paths, task.id);
+      await startReviewer(store, paths, reviewId);
+      const review = store.getReview(reviewId);
+      assert.ok(review);
+      assert.equal(review.state, "running");
+
+      if (terminal === "cancelled") cancelTask(store, task.id);
+      else failTask(store, task.id, "forced failure during review");
+      await quiesceTaskRuntimes(store, task.id);
+
+      assert.equal(store.getTask(task.id)?.state, terminal);
+      assert.equal(store.getReview(reviewId)?.state, "failed");
+      assert.match(store.getReview(reviewId)?.summary ?? "", /Review aborted/);
+      assert.ok(store.listEvents(task.id).some((event) => event.type === "review.aborted"));
+      assert.ok(store.listEvents(task.id).some((event) => event.type === "review.runtime_cleaned"));
+      assert.equal(await windowAlive(review.tmux_window), false);
+      assert.equal(existsSync(review.path), false);
+      store.close();
+    });
+  }
 });
 
 test("concurrent Reviewer launches share one durable startup owner", async () => {

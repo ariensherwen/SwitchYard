@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export type TaskKind = "implement" | "investigate";
@@ -17,7 +17,9 @@ export type TaskState =
 
 export interface ProjectRecord {
   id: string;
+  name: string;
   root_path: string;
+  remote_url: string | null;
   created_at: string;
 }
 
@@ -41,6 +43,7 @@ export interface WorkspaceRecord {
   task_id: string;
   path: string;
   branch: string;
+  provisioned: number;
   created_at: string;
 }
 
@@ -109,7 +112,7 @@ export interface EventRecord {
   created_at: string;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -415,6 +418,23 @@ export class StateStore {
             ON reviews(task_id, candidate_sha) WHERE state='running';
           PRAGMA user_version = 2;
         `);
+      }
+    });
+
+    this.transaction(() => {
+      if (row.user_version <= 2) {
+        this.db.exec(`
+          ALTER TABLE projects ADD COLUMN name TEXT NOT NULL DEFAULT '';
+          ALTER TABLE projects ADD COLUMN remote_url TEXT;
+          ALTER TABLE workspaces ADD COLUMN provisioned INTEGER NOT NULL DEFAULT 1
+            CHECK(provisioned IN (0,1));
+          PRAGMA user_version = 3;
+        `);
+        const projects = this.db
+          .prepare("SELECT id, root_path FROM projects WHERE name = ''")
+          .all() as Array<{ id: string; root_path: string }>;
+        const updateName = this.db.prepare("UPDATE projects SET name=? WHERE id=?");
+        for (const project of projects) updateName.run(basename(project.root_path), project.id);
       }
     });
   }

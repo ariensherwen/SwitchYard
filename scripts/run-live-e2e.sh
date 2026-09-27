@@ -90,10 +90,46 @@ try { await reconcile(store, paths); } finally { store.close(); }
 NODE
 }
 
+supervisor_tool() {
+  node --experimental-strip-types --input-type=module - "$ROOT_DIR" "$1" "$2" <<'NODE'
+const [root, name, params] = process.argv.slice(2);
+const { default: extension } = await import(`${root}/extensions/supervisor.ts`);
+const tools = new Map();
+extension({
+  registerTool(tool) { tools.set(tool.name, tool); },
+  on() {},
+  async sendUserMessage() {},
+  setActiveTools() {},
+});
+const tool = tools.get(name);
+if (!tool) throw new Error(`Supervisor tool not registered: ${name}`);
+const result = await tool.execute("live-e2e", JSON.parse(params));
+process.stdout.write(result.content[0].text);
+NODE
+}
+
+task_id_for_instruction() {
+  node --experimental-strip-types --input-type=module - "$ROOT_DIR" "$1" <<'NODE'
+const [root, instruction] = process.argv.slice(2);
+const { openSwitchYard } = await import(`${root}/src/context.ts`);
+const { store } = await openSwitchYard();
+try {
+  const task = store.listTasks().find((row) => row.instruction === instruction);
+  if (task) process.stdout.write(task.id);
+} finally { store.close(); }
+NODE
+}
+
 echo "Live environment: $TMP"
 echo "Project: $project_id"
-echo "1/5 original instruction dispatch"
-basic_task="$("${CLI[@]}" task create "$project_id" --kind implement 'Append exactly one line live-e2e to README.md, commit the change, verify git status is clean, then call switchyard_complete.')" || fail
+echo "1/5 Supervisor natural-reference contract + original instruction dispatch"
+basic_instruction='Append exactly one line live-e2e to README.md, commit the change, verify git status is clean, then call switchyard_complete.'
+basic_output="$(supervisor_tool switchyard_delegate "{\"project\":\"repo\",\"kind\":\"implement\",\"instruction\":\"$basic_instruction\",\"review\":false}")" || fail
+[[ "$basic_output" != *"task_id"* && ! "$basic_output" =~ [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12} ]] || fail
+basic_task="$(task_id_for_instruction "$basic_instruction")"
+[[ -n "$basic_task" ]] || fail
+supervisor_task="$(supervisor_tool switchyard_get_task '{"task":"repo live-e2e README.md"}')" || fail
+[[ "$supervisor_task" == *'"project": "repo"'* && "$supervisor_task" != *"task_id"* ]] || fail
 wait_state "$basic_task" completed
 basic_workspace="$(json_field "$basic_task" 'x.workspace.path')"
 grep -qx 'live-e2e' "$basic_workspace/README.md" || fail

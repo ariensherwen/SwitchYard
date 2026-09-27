@@ -5,7 +5,7 @@ import { enqueueMessage, signalWake } from "./inbox.ts";
 import { buildPiLaunch, shellCommand } from "./pi.ts";
 import type { StateStore, WorkerRecord } from "./state.ts";
 import { now } from "./state.ts";
-import { casTransition } from "./tasks.ts";
+import { casTransition, terminateActiveReviews } from "./tasks.ts";
 import { ensureWindow, killWindow, windowAlive } from "./tmux.ts";
 import { changedPaths, diffText, removeWorktree } from "./worktree.ts";
 
@@ -16,7 +16,7 @@ export async function startWorker(
 ): Promise<string> {
   const task = store.getTask(taskId);
   const workspace = store.getWorkspace(taskId);
-  if (task?.state !== "starting" || !workspace) {
+  if (task?.state !== "starting" || !workspace || workspace.provisioned !== 1) {
     throw new Error("task is not ready to start a worker");
   }
 
@@ -121,7 +121,7 @@ async function launchReservedWorker(
   worker: WorkerRecord,
 ): Promise<void> {
   const workspace = store.getWorkspace(worker.task_id);
-  if (!workspace) throw new Error("worker workspace not found");
+  if (workspace?.provisioned !== 1) throw new Error("worker workspace is not ready");
   const prompt =
     `You are the SwitchYard Worker for task ${worker.task_id}. ` +
     "Work only in this task Workspace. The durable Task instruction/context arrives as Pi user input. " +
@@ -202,10 +202,20 @@ export async function quiesceTaskRuntimes(
   options: { keepReviewId?: string } = {},
 ): Promise<void> {
   await stopWorker(store, taskId);
-  const review = store.getLatestReview(taskId);
-  if (review && review.id !== options.keepReviewId) {
-    await killWindow(review.tmux_window);
-    store.event(taskId, "reviewer.stopped", { review_id: review.id });
+  const task = store.getTask(taskId);
+  if (task && ["completed", "failed", "cancelled"].includes(task.state)) {
+    store.transaction(() =>
+      terminateActiveReviews(store, taskId, task.state as "completed" | "failed" | "cancelled"),
+    );
+  }
+  for (const review of store.listReviews(taskId)) {
+    if (review.id === options.keepReviewId) continue;
+    if (review.state === "running") {
+      await killWindow(review.tmux_window);
+      store.event(taskId, "reviewer.stopped", { review_id: review.id });
+    } else {
+      await cleanupFinishedReviewRuntime(store, review.id);
+    }
   }
 }
 

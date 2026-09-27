@@ -42,7 +42,9 @@ switchyard project add /path/to/repo
 switchyard project list
 ```
 
-Create and immediately dispatch work:
+The Supervisor uses Project names and natural phrases from Task instructions or summaries. Its task list and detail tools omit internal UUIDs; steering, cancellation, and Decision answers take a natural Task reference. For example, a new checkout requires a name and location. An unknown remote URL opens intake: cloning requires explicit approval plus a Project name and destination; choosing review-only creates no clone, Project, or Task.
+
+Create and immediately dispatch work from the CLI:
 
 ```sh
 switchyard task create <project-id> "Implement the requested change"
@@ -76,7 +78,7 @@ Review is opt-in with `--review` and is available only for `implement` Tasks. Ev
 
 SQLite state lives at `$SWITCHYARD_HOME/switchyard.db` with foreign keys, WAL, and a busy timeout enabled. SwitchYard persists Projects, Tasks, Workspaces, Worker history, Messages, Decisions, Reviews, Findings, and Events.
 
-Startup reconciliation preserves waiting Decisions, does not resurrect terminal Tasks, replaces missing Workers in the same task-owned Workspace, restarts interrupted Reviews for the same candidate, and fails a nonterminal Task rather than silently recreating a missing Workspace.
+Startup reconciliation resumes Tasks left queued, completes Workspace reservations interrupted before or after `git worktree add`, preserves waiting Decisions, does not resurrect terminal Tasks, replaces missing Workers in the same task-owned Workspace, and restarts interrupted Reviews for the same candidate. A missing provisioned Workspace still fails its nonterminal Task rather than silently recreating it. Terminalizing a Task also aborts any running Review durably; reconciliation cleans up its runtime and worktree.
 
 ## Development
 
@@ -94,7 +96,7 @@ Opt-in live Pi/tmux acceptance:
 SWITCHYARD_LIVE=1 ./scripts/run-live-e2e.sh
 ```
 
-The deterministic suite covers domain, SQLite, real Git, review, role separation, CLI, and tmux integration when tmux is installed. The live suite uses a disposable repository, disposable `SWITCHYARD_HOME`, and a unique tmux session.
+The deterministic suite covers domain, SQLite, real Git, review, role separation, CLI, and tmux integration when tmux is installed. The live suite also invokes the actual Supervisor extension with natural Project/Task references, then uses a disposable repository, disposable `SWITCHYARD_HOME`, and a unique tmux session.
 
 ## 0.1.0 limits
 

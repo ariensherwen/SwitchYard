@@ -10,7 +10,7 @@ import {
   startWorker,
 } from "./runtime.ts";
 import type { StateStore, TaskRecord, TaskState } from "./state.ts";
-import { failTask } from "./tasks.ts";
+import { failTask, startTask, terminateActiveReviews } from "./tasks.ts";
 import { windowAlive } from "./tmux.ts";
 
 const TERMINAL = new Set<TaskState>(["completed", "failed", "cancelled"]);
@@ -50,14 +50,30 @@ async function reconcileTask(
   const latestReview = reviews[0];
 
   if (TERMINAL.has(task.state)) {
+    store.transaction(() =>
+      terminateActiveReviews(store, task.id, task.state as "completed" | "failed" | "cancelled"),
+    );
     await quiesceTaskRuntimes(store, task.id);
-    for (const review of reviews) await cleanupFinishedReviewRuntime(store, review.id);
+    return;
+  }
+
+  if (task.state === "queued") {
+    await startTask(store, paths, task.id);
+    await startWorker(store, paths, task.id);
+    return;
+  }
+
+  if (task.state === "starting") {
+    await startTask(store, paths, task.id);
+    const worker = store.getLiveWorker(task.id);
+    if (worker?.state === "starting") await resumeReservedWorker(store, paths, worker);
+    else await startWorker(store, paths, task.id);
     return;
   }
 
   const workspace = store.getWorkspace(task.id);
-  if (!workspace || !existsSync(workspace.path)) {
-    failTask(store, task.id, "task workspace is missing during recovery");
+  if (workspace?.provisioned !== 1 || !existsSync(workspace.path)) {
+    failTask(store, task.id, "task workspace is missing or not provisioned during recovery");
     await quiesceTaskRuntimes(store, task.id);
     return;
   }
@@ -72,13 +88,6 @@ async function reconcileTask(
   }
 
   if (task.state === "waiting" || task.state === "needs_decision") return;
-
-  if (task.state === "starting") {
-    const worker = store.getLiveWorker(task.id);
-    if (worker?.state === "starting") await resumeReservedWorker(store, paths, worker);
-    else await startWorker(store, paths, task.id);
-    return;
-  }
 
   if (task.state === "running") {
     const worker = store.getLiveWorker(task.id);
@@ -101,6 +110,7 @@ async function reconcileTask(
         )
         .run(new Date().toISOString(), task.id, latest.candidate_sha);
       if (changed.changes === 1) {
+        terminateActiveReviews(store, task.id, "completed");
         store.event(task.id, "task.completed", { recovered_review_id: latest.id });
       }
     });

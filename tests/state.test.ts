@@ -5,7 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 import { StateStore } from "../src/state.ts";
-import { cancelTask, createTask, transition } from "../src/tasks.ts";
+import { cancelTask, createTask, markWaiting, resumeWaiting, transition } from "../src/tasks.ts";
 
 const dirs: string[] = [];
 afterEach(async () =>
@@ -33,7 +33,7 @@ test("migrations are repeatable and durable", async () => {
   assert.equal(reopened.listTasks().length, 1);
   assert.equal(
     (reopened.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-    2,
+    3,
   );
   reopened.close();
 });
@@ -44,6 +44,13 @@ test("schema migration reserves one active Review per candidate", async () => {
   const dbPath = path.join(dir, "switchyard.db");
   const legacy = new DatabaseSync(dbPath);
   legacy.exec(`
+    CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+    CREATE TABLE workspaces (
+      task_id TEXT PRIMARY KEY,
+      path TEXT NOT NULL UNIQUE,
+      branch TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE reviews (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -66,6 +73,12 @@ test("schema migration reserves one active Review per candidate", async () => {
     PRAGMA user_version = 1;
   `);
   legacy
+    .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('legacy-project', ?, ?)")
+    .run(dir, "2025-01-01T00:00:00.000Z");
+  legacy
+    .prepare("INSERT INTO workspaces(task_id, path, branch, created_at) VALUES (?, ?, ?, ?)")
+    .run("legacy-task", path.join(dir, "workspace"), "legacy-branch", "2025-01-01T00:00:00.000Z");
+  legacy
     .prepare(`INSERT INTO reviews(id, task_id, candidate_sha, state, tmux_window, path, created_at)
       VALUES (?, 'task', 'sha', 'running', ?, ?, ?)`)
     .run("old-review", "old-window", "/old", "2025-01-01T00:00:00.000Z");
@@ -76,6 +89,8 @@ test("schema migration reserves one active Review per candidate", async () => {
   legacy.close();
 
   const store = new StateStore(dbPath);
+  assert.equal(store.getProject("legacy-project")?.name, path.basename(dir));
+  assert.equal(store.getWorkspace("legacy-task")?.provisioned, 1);
   assert.equal(store.getReview("old-review")?.state, "failed");
   assert.equal(store.getReview("new-review")?.state, "running");
   assert.equal(store.listEvents("task")[0]?.type, "review.superseded");
@@ -138,6 +153,69 @@ test("state transition and event roll back together", async () => {
   );
   assert.equal(store.getTask(task.id)?.state, "queued");
   assert.equal(store.listEvents(task.id).length, beforeEvents);
+  store.close();
+});
+
+test("waiting and resume transitions commit with their matching Messages", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "change x", "off");
+  transition(store, task.id, "queued", "starting", "task.starting");
+  transition(store, task.id, "starting", "running", "task.started");
+
+  markWaiting(store, task.id, "blocked on access");
+  assert.equal(store.getTask(task.id)?.state, "waiting");
+  assert.ok(store.listEvents(task.id).some((event) => event.type === "task.waiting"));
+  assert.match(
+    store.listPendingMessages(task.id, "supervisor")[0]?.text ?? "",
+    /blocked on access/,
+  );
+  resumeWaiting(store, task.id, "continue after access is granted");
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.ok(store.listEvents(task.id).some((event) => event.type === "task.resumed"));
+  assert.match(
+    store.listPendingMessages(task.id, "worker")[0]?.text ?? "",
+    /continue after access is granted/,
+  );
+  store.close();
+});
+
+test("waiting transition and supervisor notification roll back together", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "change x", "off");
+  transition(store, task.id, "queued", "starting", "task.starting");
+  transition(store, task.id, "starting", "running", "task.started");
+  store.db.exec(`CREATE TRIGGER reject_message_event BEFORE INSERT ON events
+    WHEN NEW.type='message.queued' BEGIN SELECT RAISE(ABORT, 'injected message failure'); END`);
+
+  assert.throws(() => markWaiting(store, task.id, "blocked"), /injected message failure/);
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.equal(
+    store.listEvents(task.id).some((event) => event.type === "task.waiting"),
+    false,
+  );
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM messages").get()?.count, 0);
+  store.close();
+});
+
+test("resume transition and required Worker Message roll back together", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "change x", "off");
+  transition(store, task.id, "queued", "starting", "task.starting");
+  transition(store, task.id, "starting", "running", "task.started");
+  markWaiting(store, task.id, "blocked");
+  store.db.exec(`CREATE TRIGGER reject_message_event BEFORE INSERT ON events
+    WHEN NEW.type='message.queued' BEGIN SELECT RAISE(ABORT, 'injected message failure'); END`);
+
+  assert.throws(
+    () => resumeWaiting(store, task.id, "continue with this"),
+    /injected message failure/,
+  );
+  assert.equal(store.getTask(task.id)?.state, "waiting");
+  assert.equal(
+    store.listEvents(task.id).some((event) => event.type === "task.resumed"),
+    false,
+  );
+  assert.equal(store.listPendingMessages(task.id, "worker").length, 0);
   store.close();
 });
 

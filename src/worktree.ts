@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { realpath } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -28,6 +29,12 @@ export async function assertRegisterableProject(
   }
 }
 
+export async function cloneRepository(remoteUrl: string, destination: string): Promise<void> {
+  const absoluteDestination = path.resolve(destination);
+  await mkdir(path.dirname(absoluteDestination), { recursive: true });
+  await git(path.dirname(absoluteDestination), ["clone", "--", remoteUrl, absoluteDestination]);
+}
+
 export async function assertProjectClean(root: string): Promise<void> {
   const { stdout } = await git(root, ["status", "--porcelain"]);
   if (stdout.trim()) throw new Error(`project checkout is dirty: ${root}`);
@@ -38,6 +45,50 @@ export async function currentHead(root: string): Promise<string> {
   return stdout.trim();
 }
 
+export async function taskWorkspaceBase(
+  projectRoot: string,
+  destination: string,
+  branch: string,
+): Promise<string> {
+  if (existsSync(destination)) {
+    const actualBranch = (await git(destination, ["branch", "--show-current"])).stdout.trim();
+    if (actualBranch !== branch)
+      throw new Error(`workspace is on unexpected branch ${actualBranch}`);
+    return currentHead(destination);
+  }
+  await assertProjectClean(projectRoot);
+  return currentHead(projectRoot);
+}
+
+export async function ensureTaskWorkspace(
+  projectRoot: string,
+  destination: string,
+  branch: string,
+  baseSha: string,
+): Promise<WorkspaceInfo> {
+  if (existsSync(destination)) {
+    const actualBranch = (await git(destination, ["branch", "--show-current"])).stdout.trim();
+    if (actualBranch !== branch)
+      throw new Error(`workspace is on unexpected branch ${actualBranch}`);
+    const actualHead = await currentHead(destination);
+    if (actualHead !== baseSha)
+      throw new Error("unprovisioned workspace moved from its reserved base");
+    return { path: destination, branch, baseSha };
+  }
+
+  await mkdir(path.dirname(destination), { recursive: true });
+  if (await localBranchExists(projectRoot, branch)) {
+    const branchHead = (
+      await git(projectRoot, ["rev-parse", `refs/heads/${branch}`])
+    ).stdout.trim();
+    if (branchHead !== baseSha) throw new Error("reserved workspace branch moved from its base");
+    await git(projectRoot, ["worktree", "add", destination, branch]);
+  } else {
+    await git(projectRoot, ["worktree", "add", "-b", branch, destination, baseSha]);
+  }
+  return { path: destination, branch, baseSha };
+}
+
 export async function createWorkspace(
   projectRoot: string,
   destination: string,
@@ -45,8 +96,7 @@ export async function createWorkspace(
 ): Promise<WorkspaceInfo> {
   await assertProjectClean(projectRoot);
   const baseSha = await currentHead(projectRoot);
-  await git(projectRoot, ["worktree", "add", "-b", branch, destination, baseSha]);
-  return { path: destination, branch, baseSha };
+  return ensureTaskWorkspace(projectRoot, destination, branch, baseSha);
 }
 
 export async function validateImplementCandidate(
@@ -140,6 +190,15 @@ export async function removeWorktree(projectRoot: string, workspace: string): Pr
   // Never force-delete a Task workspace. If Git refuses removal, preserve the workspace
   // and surface the error so a human can inspect it.
   await git(projectRoot, ["worktree", "remove", workspace]);
+}
+
+async function localBranchExists(projectRoot: string, branch: string): Promise<boolean> {
+  try {
+    await git(projectRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function git(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {

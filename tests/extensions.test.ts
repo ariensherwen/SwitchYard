@@ -30,7 +30,7 @@ async function fixture(state: "running" | "waiting" = "running") {
   process.env.SWITCHYARD_HOME = paths.home;
   const store = new StateStore(paths.database);
   store.db
-    .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, ?)")
+    .prepare("INSERT INTO projects(id, name, root_path, created_at) VALUES ('p', 'sample', ?, ?)")
     .run(root, now());
   const task = createTask(store, "p", "implement", "Do the durable instruction", "off");
   transition(store, task.id, "queued", "starting", "task.starting");
@@ -137,16 +137,132 @@ test("Supervisor steering resumes a waiting Task through the shared domain opera
   const { store, taskId } = await fixture("waiting");
   const fake = fakePi();
   supervisorExtension(fake.api);
-  const tool = fake.getTool<{ task_id: string; text: string }>("switchyard_send_message");
+  const tool = fake.getTool<{ task: string; text: string }>("switchyard_send_message");
   assert.ok(tool);
 
-  await tool.execute("call", { task_id: taskId, text: "Resume with this guidance" });
+  await tool.execute("call", {
+    task: "sample durable instruction",
+    text: "Resume with this guidance",
+  });
 
   assert.equal(store.getTask(taskId)?.state, "running");
   assert.match(
     store.listPendingMessages(taskId, "worker")[0]?.text ?? "",
     /Resume with this guidance/,
   );
+  store.close();
+});
+
+test("Supervisor contract uses natural Task references and omits internal record IDs", async () => {
+  const { store, taskId } = await fixture("waiting");
+  const fake = fakePi();
+  supervisorExtension(fake.api);
+
+  const delegateTool = fake.getTool<{ project: string; instruction: string }>(
+    "switchyard_delegate",
+  );
+  const listTool = fake.getTool<Record<string, never>>("switchyard_list_tasks");
+  const getTool = fake.getTool<{ task: string }>("switchyard_get_task");
+  const sendTool = fake.getTool<{ task: string; text: string }>("switchyard_send_message");
+  const resolveTool = fake.getTool<{ task: string; answer: string }>("switchyard_resolve_decision");
+  const cancelTool = fake.getTool<{ task: string }>("switchyard_cancel_task");
+  assert.ok(delegateTool && listTool && getTool && sendTool && resolveTool && cancelTool);
+  const schemas = [
+    delegateTool.parameters,
+    listTool.parameters,
+    getTool.parameters,
+    sendTool.parameters,
+    resolveTool.parameters,
+    cancelTool.parameters,
+  ];
+  assert.doesNotMatch(JSON.stringify(schemas), /task_id|decision_id/);
+  store.db.prepare("UPDATE tasks SET failure=? WHERE id=?").run(taskId, taskId);
+
+  const listed = (await listTool.execute("call", {})) as { details: unknown };
+  const found = (await getTool.execute("call", { task: "sample durable instruction" })) as {
+    details: { project: string; task: string; state: string; failure: string };
+  };
+  assert.equal(found.details.project, "sample");
+  assert.match(found.details.task, /durable instruction/);
+  assert.equal(found.details.state, "waiting");
+  assert.equal(found.details.failure, "an internal identifier");
+  for (const value of [listed.details, found.details]) {
+    const serialized = JSON.stringify(value);
+    assert.doesNotMatch(
+      serialized,
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+    );
+    assert.doesNotMatch(serialized, /task_id|decision_id/);
+  }
+
+  const { requestDecision } = await import("../src/tasks.ts");
+  store.db.prepare("UPDATE tasks SET state='running' WHERE id=?").run(taskId);
+  const decisionId = requestDecision(store, taskId, "Which value?", undefined, ["alpha", "beta"]);
+  await resolveTool.execute("call", { task: "sample durable instruction", answer: "alpha" });
+  assert.equal(store.getDecision(decisionId)?.state, "resolved");
+  assert.equal(store.getTask(taskId)?.state, "running");
+  store.close();
+});
+
+test("unknown projects enter intake and remote review-only creates nothing", async () => {
+  const { store } = await fixture();
+  const fake = fakePi();
+  supervisorExtension(fake.api);
+  const delegate = fake.getTool<{
+    project: string;
+    kind: "implement" | "investigate";
+    instruction: string;
+    review: boolean;
+    remote_action?: "clone" | "review_only";
+  }>("switchyard_delegate");
+  assert.ok(delegate);
+
+  const unknown = (await delegate.execute("call", {
+    project: "unknown-project",
+    kind: "investigate",
+    instruction: "Inspect it",
+    review: false,
+  })) as { details: { status: string; required: string[] } };
+  assert.equal(unknown.details.status, "project_intake_required");
+  assert.deepEqual(unknown.details.required, ["project_name", "project_location"]);
+  const cloneChoice = (await delegate.execute("call", {
+    project: "https://example.invalid/repo.git",
+    kind: "investigate",
+    instruction: "Inspect the remote",
+    review: false,
+  })) as { details: { status: string; choices: string[] } };
+  assert.equal(cloneChoice.details.status, "project_intake_required");
+  assert.deepEqual(cloneChoice.details.choices, ["clone", "review_only"]);
+  const cloneNeedsDetails = (await delegate.execute("call", {
+    project: "https://example.invalid/repo.git",
+    kind: "investigate",
+    instruction: "Clone only after intake",
+    review: false,
+    remote_action: "clone",
+  })) as { details: { status: string; action: string; required: string[] } };
+  assert.equal(cloneNeedsDetails.details.status, "project_intake_required");
+  assert.equal(cloneNeedsDetails.details.action, "clone");
+  assert.deepEqual(cloneNeedsDetails.details.required, ["project_name", "project_location"]);
+  const remote = (await delegate.execute("call", {
+    project: "https://example.invalid/repo.git",
+    kind: "investigate",
+    instruction: "Review only",
+    review: false,
+    remote_action: "review_only",
+  })) as {
+    details: { status: string; cloned: boolean; registered: boolean; task_started: boolean };
+  };
+  assert.deepEqual(remote.details, {
+    status: "review_only",
+    project: "https://example.invalid/repo.git",
+    cloned: false,
+    registered: false,
+    task_started: false,
+    message:
+      "No clone, Project registration, or Task was created. Provide a local checkout or explicitly choose clone with a name and destination to delegate work.",
+  });
+  assert.equal(store.listProjects().length, 1);
+  assert.equal(store.listTasks().length, 1);
   store.close();
 });
 

@@ -2,7 +2,7 @@
 
 ## Project
 
-A registered Git checkout managed by SwitchYard. Registration stores its canonical Git top-level real path. Generated SwitchYard worktrees are not Projects.
+A named, registered Git checkout managed by SwitchYard. Registration stores its display name, canonical Git top-level real path, and optional source URL for an explicit clone. Generated SwitchYard worktrees are not Projects. A remote URL is not a Project until the human approves cloning; a review-only choice creates no clone, registration, or Task.
 
 ## Task
 
@@ -20,11 +20,11 @@ A durable unit of requested work. Kinds are `implement` and `investigate`.
 | `failed` | none |
 | `cancelled` | none |
 
-`completed`, `failed`, and `cancelled` are terminal. Terminal Tasks are never resurrected. `starting` covers Workspace creation and Worker startup. `reviewing` means one candidate revision is under independent review.
+`completed`, `failed`, and `cancelled` are terminal. Terminal Tasks are never resurrected. `starting` covers durable Workspace reservation/provisioning and Worker startup. Recovery resumes `queued` Tasks and completes interrupted Workspace provisioning. `reviewing` means one candidate revision is under independent review. If a Task becomes terminal during a Review, the Review is durably aborted in the same transaction; runtime/worktree cleanup follows.
 
 ## Workspace
 
-One Git worktree owned by one Task. The Workspace belongs to the Task, not a Worker, and survives Worker replacement and cancellation.
+One Git worktree owned by one Task. Its path, branch, and base revision are reserved durably before Git creates it, then marked provisioned once creation is verified. The Workspace belongs to the Task, not a Worker, and survives Worker replacement and cancellation.
 
 ## Worker
 
@@ -34,7 +34,7 @@ A Reviewer is not a Worker.
 
 ## Supervisor
 
-The primary Pi session controlling SwitchYard. It delegates, inspects, steers, resolves Decisions, and cancels Tasks without directly taking Worker or Reviewer authority.
+The primary Pi session controlling SwitchYard. It refers to Projects by name and Tasks by natural descriptions, never requires Task or Decision IDs, and receives human-readable records without internal IDs. It delegates, inspects, steers, resolves Decisions, and cancels Tasks without directly taking Worker or Reviewer authority. Unknown Projects enter intake; unknown remote URLs require an explicit clone or review-only choice, and cloning requires a name and destination.
 
 ## Message
 

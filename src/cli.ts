@@ -144,7 +144,7 @@ async function handleTask(
       await startWorker(store, paths, task.id);
     } catch (error) {
       const current = store.getTask(task.id);
-      if (current && current.state === "starting") {
+      if (current && (current.state === "queued" || current.state === "starting")) {
         failTask(
           store,
           task.id,
