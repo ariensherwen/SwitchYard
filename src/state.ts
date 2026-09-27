@@ -1,6 +1,6 @@
-import { DatabaseSync } from "node:sqlite";
-import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 export type TaskKind = "implement" | "investigate";
 export type ReviewPolicy = "off" | "loop";
@@ -146,7 +146,9 @@ export class StateStore {
   }
 
   getProject(id: string): ProjectRecord | undefined {
-    return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRecord | undefined;
+    return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as
+      | ProjectRecord
+      | undefined;
   }
 
   getProjectByRoot(rootPath: string): ProjectRecord | undefined {
@@ -156,7 +158,9 @@ export class StateStore {
   }
 
   listProjects(): ProjectRecord[] {
-    return this.db.prepare("SELECT * FROM projects ORDER BY created_at, id").all() as unknown as ProjectRecord[];
+    return this.db
+      .prepare("SELECT * FROM projects ORDER BY created_at, id")
+      .all() as unknown as ProjectRecord[];
   }
 
   getTask(id: string): TaskRecord | undefined {
@@ -164,7 +168,9 @@ export class StateStore {
   }
 
   listTasks(): TaskRecord[] {
-    return this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC, id DESC").all() as unknown as TaskRecord[];
+    return this.db
+      .prepare("SELECT * FROM tasks ORDER BY created_at DESC, id DESC")
+      .all() as unknown as TaskRecord[];
   }
 
   getWorkspace(taskId: string): WorkspaceRecord | undefined {
@@ -175,28 +181,38 @@ export class StateStore {
 
   getActiveWorker(taskId: string): WorkerRecord | undefined {
     return this.db
-      .prepare("SELECT * FROM workers WHERE task_id = ? AND state = 'active' ORDER BY created_at DESC LIMIT 1")
+      .prepare(
+        "SELECT * FROM workers WHERE task_id = ? AND state = 'active' ORDER BY created_at DESC LIMIT 1",
+      )
       .get(taskId) as WorkerRecord | undefined;
   }
 
   listPendingMessages(taskId: string, recipient: "worker" | "supervisor"): MessageRecord[] {
     return this.db
-      .prepare("SELECT * FROM messages WHERE task_id = ? AND recipient = ? AND state = 'pending' ORDER BY created_at, id")
+      .prepare(
+        "SELECT * FROM messages WHERE task_id = ? AND recipient = ? AND state = 'pending' ORDER BY created_at, id",
+      )
       .all(taskId, recipient) as unknown as MessageRecord[];
   }
 
   getOpenDecision(taskId: string): DecisionRecord | undefined {
     return this.db
-      .prepare("SELECT * FROM decisions WHERE task_id = ? AND state = 'open' ORDER BY created_at DESC LIMIT 1")
+      .prepare(
+        "SELECT * FROM decisions WHERE task_id = ? AND state = 'open' ORDER BY created_at DESC LIMIT 1",
+      )
       .get(taskId) as DecisionRecord | undefined;
   }
 
   getDecision(id: string): DecisionRecord | undefined {
-    return this.db.prepare("SELECT * FROM decisions WHERE id = ?").get(id) as DecisionRecord | undefined;
+    return this.db.prepare("SELECT * FROM decisions WHERE id = ?").get(id) as
+      | DecisionRecord
+      | undefined;
   }
 
   getReview(id: string): ReviewRecord | undefined {
-    return this.db.prepare("SELECT * FROM reviews WHERE id = ?").get(id) as ReviewRecord | undefined;
+    return this.db.prepare("SELECT * FROM reviews WHERE id = ?").get(id) as
+      | ReviewRecord
+      | undefined;
   }
 
   getLatestReview(taskId: string): ReviewRecord | undefined {
@@ -206,12 +222,16 @@ export class StateStore {
   }
 
   listFindings(reviewId: string): FindingRecord[] {
-    return this.db.prepare("SELECT * FROM findings WHERE review_id = ? ORDER BY rowid").all(reviewId) as unknown as FindingRecord[];
+    return this.db
+      .prepare("SELECT * FROM findings WHERE review_id = ? ORDER BY rowid")
+      .all(reviewId) as unknown as FindingRecord[];
   }
 
   listEvents(taskId?: string): EventRecord[] {
     if (taskId) {
-      return this.db.prepare("SELECT * FROM events WHERE task_id = ? ORDER BY id").all(taskId) as unknown as EventRecord[];
+      return this.db
+        .prepare("SELECT * FROM events WHERE task_id = ? ORDER BY id")
+        .all(taskId) as unknown as EventRecord[];
     }
     return this.db.prepare("SELECT * FROM events ORDER BY id").all() as unknown as EventRecord[];
   }
@@ -225,7 +245,9 @@ export class StateStore {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
     if (row.user_version > SCHEMA_VERSION) {
-      throw new Error(`database schema ${row.user_version} is newer than supported ${SCHEMA_VERSION}`);
+      throw new Error(
+        `database schema ${row.user_version} is newer than supported ${SCHEMA_VERSION}`,
+      );
     }
     if (row.user_version === SCHEMA_VERSION) return;
 

@@ -1,6 +1,6 @@
 import { openSwitchYard } from "../src/context.ts";
 import { reconcile } from "../src/reconcile.ts";
-import { submitReview, type ReviewSubmission } from "../src/review.ts";
+import { type ReviewSubmission, submitReview } from "../src/review.ts";
 import { wakeSupervisor, wakeWorker } from "../src/runtime.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
 import { enumSchema, objectSchema, stringArraySchema, stringSchema } from "./schema.ts";

@@ -123,7 +123,10 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     name: "switchyard_send_message",
     label: "Steer task",
     description: "Persist a steering message for a nonterminal task and wake its Worker.",
-    parameters: objectSchema({ task_id: stringSchema(), text: stringSchema() }, ["task_id", "text"]),
+    parameters: objectSchema({ task_id: stringSchema(), text: stringSchema() }, [
+      "task_id",
+      "text",
+    ]),
     async execute(_id: string, params: SendMessageParams) {
       const { store } = await openSwitchYard();
       try {

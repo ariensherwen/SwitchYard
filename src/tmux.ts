@@ -5,7 +5,8 @@ const execFileAsync = promisify(execFile);
 export const TMUX_SESSION = process.env.SWITCHYARD_TMUX_SESSION || "switchyard";
 
 export async function ensureSession(): Promise<void> {
-  if (!(await hasSession())) await tmux(["new-session", "-d", "-s", TMUX_SESSION, "-n", "supervisor"]);
+  if (!(await hasSession()))
+    await tmux(["new-session", "-d", "-s", TMUX_SESSION, "-n", "supervisor"]);
 }
 
 export async function hasSession(): Promise<boolean> {

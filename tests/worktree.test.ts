@@ -6,8 +6,8 @@ import path from "node:path";
 import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 import {
-  canSafelyClean,
   canonicalRepositoryRoot,
+  canSafelyClean,
   createWorkspace,
   validateImplementCandidate,
 } from "../src/worktree.ts";
