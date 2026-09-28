@@ -14,13 +14,14 @@ import {
   cancelTask,
   createTask,
   failTask,
+  markWorkspaceCleaned,
   resolveDecision,
   reviewPolicyForTask,
   startTask,
   steerTask,
   taskSourceRoot,
 } from "./tasks.ts";
-import { attachWindow, ensureWindow } from "./tmux.ts";
+import { attachWindow, captureWindow, ensureWindow } from "./tmux.ts";
 import { canSafelyClean, canSafelyCleanTransient, removeWorktree } from "./worktree.ts";
 
 const HELP = `SwitchYard
@@ -206,7 +207,8 @@ async function handleTask(
   if (command === "attach") {
     const worker = store.getActiveWorker(taskId);
     if (!worker) throw new Error("task has no active worker");
-    return await attachWindow(worker.tmux_window);
+    process.stdout.write(await captureWindow(worker.tmux_window));
+    return 0;
   }
   if (command === "clean") {
     if (!["completed", "failed", "cancelled"].includes(task.state)) {
@@ -236,6 +238,7 @@ async function handleTask(
       }
       await removeWorktree(sourceRoot, workspace.path);
     }
+    markWorkspaceCleaned(store, taskId);
     return 0;
   }
   throw new Error(`unknown task command: ${command}`);

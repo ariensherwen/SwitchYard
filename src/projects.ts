@@ -14,7 +14,7 @@ export async function addProject(
   remoteUrl?: string,
 ): Promise<ProjectRecord> {
   const root = await canonicalRepositoryRoot(input);
-  await assertRegisterableProject(root, paths.worktrees);
+  await assertRegisterableProject(root, [paths.worktrees, paths.sources, paths.reviews]);
   const existing = store.getProjectByRoot(root);
   if (existing) return existing;
   const projectName = normalizeProjectName(name ?? path.basename(root));

@@ -20,12 +20,18 @@ export async function canonicalRepositoryRoot(input: string): Promise<string> {
 
 export async function assertRegisterableProject(
   root: string,
-  switchyardWorktrees: string,
+  managedRoots: string[],
 ): Promise<void> {
   const canonical = await realpath(root);
-  const generated = path.resolve(switchyardWorktrees) + path.sep;
-  if ((canonical + path.sep).startsWith(generated)) {
-    throw new Error("generated SwitchYard worktrees cannot be registered as Projects");
+  for (const managedRoot of managedRoots) {
+    const canonicalManagedRoot = await realpath(managedRoot);
+    const relative = path.relative(canonicalManagedRoot, canonical);
+    if (
+      relative === "" ||
+      (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+    ) {
+      throw new Error("SwitchYard-managed checkouts cannot be registered as Projects");
+    }
   }
 }
 

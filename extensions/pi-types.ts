@@ -3,6 +3,7 @@ export type PiLifecycleEvent =
   | "turn_start"
   | "turn_end"
   | "agent_end"
+  | "agent_settled"
   | "session_shutdown"
   | "tool_call";
 

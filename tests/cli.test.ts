@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { now, StateStore } from "../src/state.ts";
-import { createTask } from "../src/tasks.ts";
+import { cancelTask, createTask, startTask } from "../src/tasks.ts";
 import { createWorkspace } from "../src/worktree.ts";
 
 const exec = promisify(execFile);
@@ -70,6 +70,7 @@ test("CLI reviews implement Tasks by default and supports explicit opt-out", asy
   const home = path.join(rootDir, "home");
   const bin = path.join(rootDir, "bin");
   const tmuxState = path.join(rootDir, "tmux-state");
+  const tmuxCommands = path.join(rootDir, "tmux-commands");
   await mkdir(repo);
   await mkdir(bin);
   await exec("git", ["init", "-b", "main"], { cwd: repo });
@@ -87,13 +88,18 @@ test("CLI reviews implement Tasks by default and supports explicit opt-out", asy
   const tmux = path.join(bin, "tmux");
   await writeFile(
     tmux,
-    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(tmuxState)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) i=0; while IFS= read -r name; do i=$((i+1)); printf '@%s\\t%s\\n' "$i" "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  *) : ;;\nesac\n`,
+    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(tmuxState)}\ncommands=${JSON.stringify(tmuxCommands)}\nprintf '%s\\n' "$1" >> "$commands"\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) i=0; while IFS= read -r name; do i=$((i+1)); printf '@%s\\t%s\\n' "$i" "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  capture-pane) echo 'read-only Worker pane' ;;\n  attach-session|switch-client) exit 99 ;;\n  *) : ;;\nesac\n`,
   );
   await chmod(tmux, 0o755);
   const env = { ...process.env, SWITCHYARD_HOME: home, PATH: `${bin}:${process.env.PATH}` };
+  delete env.TMUX;
 
   const defaultTask = await run(["task", "create", "p", "Implement with review"], env);
   assert.equal(defaultTask.code, 0, defaultTask.stderr);
+  const attached = await run(["task", "attach", defaultTask.stdout.trim()], env);
+  assert.equal(attached.code, 0, attached.stderr);
+  assert.match(attached.stdout, /read-only Worker pane/);
+  assert.doesNotMatch(await readFile(tmuxCommands, "utf8"), /attach-session|switch-client/);
   const optOutTask = await run(
     ["task", "create", "p", "--no-review", "Implement without review"],
     env,
@@ -125,6 +131,62 @@ test("CLI reviews implement Tasks by default and supports explicit opt-out", asy
     "off",
   );
   assert.equal(verified.listTasks().length, 3);
+  verified.close();
+});
+
+test("project add rejects all SwitchYard-managed checkouts", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-managed-project-"));
+  dirs.push(root);
+  const home = path.join(root, "home");
+  const paths = await ensureSwitchYardHome({ SWITCHYARD_HOME: home });
+  const env = { ...process.env, SWITCHYARD_HOME: home };
+
+  for (const managedRoot of [paths.sources, paths.reviews, paths.worktrees]) {
+    const checkout = path.join(managedRoot, "managed-repo");
+    await mkdir(checkout);
+    await exec("git", ["init", "-b", "main"], { cwd: checkout });
+    const added = await run(["project", "add", checkout], env);
+    assert.equal(added.code, 1);
+    assert.match(added.stderr, /SwitchYard-managed checkouts cannot be registered/);
+  }
+
+  const store = new StateStore(paths.database);
+  assert.equal(store.listProjects().length, 0);
+  store.close();
+});
+
+test("task clean clears durable provisioned state after removing the Workspace", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-clean-state-"));
+  dirs.push(root);
+  const repo = path.join(root, "repo");
+  const home = path.join(root, "home");
+  await mkdir(repo);
+  await exec("git", ["init", "-b", "main"], { cwd: repo });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  await exec("git", ["config", "user.name", "SwitchYard Test"], { cwd: repo });
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await exec("git", ["add", "."], { cwd: repo });
+  await exec("git", ["commit", "-m", "base"], { cwd: repo });
+  const env = { ...process.env, SWITCHYARD_HOME: home };
+  const paths = await ensureSwitchYardHome(env);
+  const store = new StateStore(paths.database);
+  store.db
+    .prepare("INSERT INTO projects(id, root_path, created_at) VALUES ('p', ?, ?)")
+    .run(repo, now());
+  const task = createTask(store, "p", "implement", "clean this task", "off");
+  await startTask(store, paths, task.id);
+  const workspace = store.getWorkspace(task.id);
+  assert.ok(workspace);
+  cancelTask(store, task.id);
+  store.close();
+
+  const cleaned = await run(["task", "clean", task.id], env);
+  assert.equal(cleaned.code, 0, cleaned.stderr);
+  await assert.rejects(access(workspace.path));
+
+  const verified = new StateStore(paths.database);
+  assert.equal(verified.getWorkspace(task.id)?.provisioned, 0);
+  assert.ok(verified.listEvents(task.id).some((event) => event.type === "workspace.cleaned"));
   verified.close();
 });
 

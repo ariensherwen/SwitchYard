@@ -83,6 +83,13 @@ export async function killWindow(window: string): Promise<void> {
   }
 }
 
+export async function captureWindow(window: string): Promise<string> {
+  const windowId = await findWindowId(window);
+  if (!windowId) throw new Error(`tmux window not found: ${window}`);
+  const { stdout } = await tmux(["capture-pane", "-p", "-t", windowId]);
+  return stdout;
+}
+
 export async function attachWindow(window: string): Promise<number> {
   const windowId = await findWindowId(window);
   if (!windowId) throw new Error(`tmux window not found: ${window}`);

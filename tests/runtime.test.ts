@@ -190,6 +190,59 @@ test("answering a Decision replaces its dead Worker before returning", async () 
   store.close();
 });
 
+test("reserved Worker recovery does not launch a terminal Task", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "cancel before resume", "off");
+  await startTask(store, paths, task.id);
+  const workerId = "cancelled-reserved-worker";
+  store.db
+    .prepare(
+      "INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'starting', ?, ?)",
+    )
+    .run(workerId, task.id, `task-${task.id}`, now());
+  const worker = store.getLiveWorker(task.id);
+  assert.ok(worker);
+  const cancellingStore = new StateStore(paths.database);
+  cancelTask(cancellingStore, task.id);
+
+  await assert.rejects(resumeReservedWorker(store, paths, worker), /task is cancelled/);
+
+  assert.equal(existsSync(stateFile), false);
+  assert.equal(store.getTask(task.id)?.state, "cancelled");
+  assert.equal(store.listWorkers(task.id)[0]?.state, "stopped");
+  cancellingStore.close();
+  store.close();
+});
+
+test("reserved Worker recovery cleans up when cancellation wins after launch", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "cancel after resume launch", "off");
+  await startTask(store, paths, task.id);
+  markRunning(store, task.id);
+  const workerId = "racing-reserved-worker";
+  store.db
+    .prepare(
+      "INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'starting', ?, ?)",
+    )
+    .run(workerId, task.id, `task-${task.id}`, now());
+  const worker = store.getLiveWorker(task.id);
+  assert.ok(worker);
+  const cancellingStore = new StateStore(paths.database);
+
+  await assert.rejects(
+    resumeReservedWorker(store, paths, worker, {
+      afterLaunch: () => cancelTask(cancellingStore, task.id),
+    }),
+    /cannot activate reserved Worker while task is cancelled/,
+  );
+
+  assert.equal(store.getTask(task.id)?.state, "cancelled");
+  assert.equal(store.listWorkers(task.id)[0]?.state, "stopped");
+  assert.equal((await readFile(stateFile, "utf8")).trim(), "");
+  cancellingStore.close();
+  store.close();
+});
+
 test("recovery starts a Task left queued by a crash after creation", async () => {
   const { paths, store } = await fixture();
   const task = createTask(store, "p", "implement", "queued recovery", "off");

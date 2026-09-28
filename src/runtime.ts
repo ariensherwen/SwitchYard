@@ -47,6 +47,10 @@ export interface WorkerReplacementHooks {
   afterReservation?: () => void | Promise<void>;
 }
 
+export interface WorkerResumeHooks {
+  afterLaunch?: () => void | Promise<void>;
+}
+
 export async function replaceWorker(
   store: StateStore,
   paths: SwitchYardPaths,
@@ -94,14 +98,61 @@ export async function resumeReservedWorker(
   store: StateStore,
   paths: SwitchYardPaths,
   worker: WorkerRecord,
+  hooks: WorkerResumeHooks = {},
 ): Promise<void> {
   if (worker.state !== "starting") throw new Error("worker is not reserved for startup");
-  await launchReservedWorker(store, paths, worker);
   const task = store.getTask(worker.task_id);
-  if (!task) throw new Error("task not found for reserved worker");
-  if (task.state === "starting") activateWorkerAndTask(store, task.id, worker.id);
-  else if (task.state === "running") activateReservedWorker(store, task.id, worker.id);
-  else throw new Error(`cannot activate reserved worker while task is ${task.state}`);
+  const reservedWorker = store.getLiveWorker(worker.task_id);
+  if (
+    task?.state === "running" &&
+    reservedWorker?.id === worker.id &&
+    reservedWorker.state === "active"
+  ) {
+    return;
+  }
+  if (!task || !["starting", "running"].includes(task.state)) {
+    await cleanupFailedReservedWorker(
+      store,
+      reservedWorker?.id === worker.id ? reservedWorker : worker,
+    );
+    throw new Error(`cannot resume reserved Worker while task is ${task?.state ?? "missing"}`);
+  }
+  if (reservedWorker?.id !== worker.id || reservedWorker.state !== "starting") {
+    await cleanupFailedReservedWorker(store, worker);
+    throw new Error("reserved Worker identity is no longer starting");
+  }
+
+  try {
+    await launchReservedWorker(store, paths, reservedWorker);
+    await hooks.afterLaunch?.();
+    const currentTask = store.getTask(worker.task_id);
+    const currentWorker = store.getLiveWorker(worker.task_id);
+    if (currentWorker?.id !== worker.id || currentWorker.state !== "starting") {
+      throw new Error("reserved Worker identity is no longer starting");
+    }
+    if (currentTask?.state === "starting") activateWorkerAndTask(store, currentTask.id, worker.id);
+    else if (currentTask?.state === "running")
+      activateReservedWorker(store, currentTask.id, worker.id);
+    else
+      throw new Error(
+        `cannot activate reserved Worker while task is ${currentTask?.state ?? "missing"}`,
+      );
+  } catch (error) {
+    await cleanupFailedReservedWorker(store, reservedWorker);
+    throw error;
+  }
+}
+
+async function cleanupFailedReservedWorker(store: StateStore, worker: WorkerRecord): Promise<void> {
+  const task = store.getTask(worker.task_id);
+  const liveWorker = store.getLiveWorker(worker.task_id);
+  if (task?.state === "running" && liveWorker?.id === worker.id && liveWorker.state === "active") {
+    return;
+  }
+  if (!liveWorker || liveWorker.id === worker.id) {
+    await killWindow(worker.tmux_window);
+    retireWorker(store, worker.task_id, worker.id, "reserved Worker recovery failed");
+  }
 }
 
 function reserveWorker(store: StateStore, taskId: string, replacement: boolean): WorkerRecord {

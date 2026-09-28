@@ -66,7 +66,7 @@ switchyard task cancel <task-id>
 switchyard task clean <task-id>
 ```
 
-Messages and Decision answers are stored before delivery. Cancellation stops active runtimes but preserves the task Workspace. Terminalizing a Task cancels any open Decision. `task clean` refuses deletion when a registered Project workspace contains unlanded commits, or when a transient source or workspace contains uncommitted work; there is no force cleanup.
+Messages and Decision answers are stored before delivery. `task attach` prints a read-only Worker pane snapshot; use `task send` to steer it. Cancellation stops active runtimes but preserves the task Workspace. Terminalizing a Task cancels any open Decision. `task clean` refuses deletion when a registered Project workspace contains unlanded commits, or when a transient source or workspace contains uncommitted work; successful cleanup clears the Workspace's provisioned state.
 
 ## Completion and review
 

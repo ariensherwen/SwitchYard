@@ -37,6 +37,7 @@ export default function workerExtension(pi: PiExtensionApi) {
   const workerId = requiredEnv("SWITCHYARD_WORKER_ID");
   let stopWakePump: (() => void) | undefined;
   let delivering = false;
+  const awaitingConsumption = new Set<string>();
 
   const result = (value: unknown) => ({
     content: [
@@ -147,13 +148,18 @@ export default function workerExtension(pi: PiExtensionApi) {
         if (!task) return;
         setToolsForState(pi, task.state);
         if (task.state !== "running") return;
-        const messages = store.listPendingMessages(taskId, "worker");
+        const messages = store
+          .listPendingMessages(taskId, "worker")
+          .filter((message) => !awaitingConsumption.has(message.id));
         if (messages.length === 0) return;
+        for (const message of messages) awaitingConsumption.add(message.id);
         const payload = messages.map((message) => message.text).join("\n\n---\n\n");
-        await pi.sendUserMessage(payload, { deliverAs: "steer" });
-        store.transaction(() => {
-          for (const message of messages) markDelivered(store, message.id);
-        });
+        try {
+          await pi.sendUserMessage(payload, { deliverAs: "steer" });
+        } catch (error) {
+          for (const message of messages) awaitingConsumption.delete(message.id);
+          throw error;
+        }
       } finally {
         store.close();
       }
@@ -200,6 +206,25 @@ export default function workerExtension(pi: PiExtensionApi) {
   pi.on("agent_end", async () => {
     await record("worker.settled");
     await deliverPending();
+  });
+  // Pi can resolve sendUserMessage when it only queues steering; agent_settled confirms queued work finished.
+  pi.on("agent_settled", async () => {
+    const messageIds = [...awaitingConsumption];
+    if (messageIds.length === 0) return;
+    try {
+      const { store } = await openSwitchYard();
+      try {
+        store.transaction(() => {
+          for (const messageId of messageIds) markDelivered(store, messageId);
+        });
+      } finally {
+        store.close();
+      }
+      for (const messageId of messageIds) awaitingConsumption.delete(messageId);
+    } catch (error) {
+      for (const messageId of messageIds) awaitingConsumption.delete(messageId);
+      throw error;
+    }
   });
   pi.on("session_shutdown", async () => {
     stopWakePump?.();

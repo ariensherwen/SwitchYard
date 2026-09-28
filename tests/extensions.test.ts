@@ -107,6 +107,9 @@ test("idle Worker receives durable startup and wake-driven steering as Pi user m
   assert.ok(initialMessage);
   assert.match(initialMessage.text, /Original Task instruction/);
   assert.deepEqual(initialMessage.options, { deliverAs: "steer" });
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 1);
+  await fake.handlers.get("agent_settled")?.();
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
   const enabledTools = fake.activeTools.at(-1);
   assert.ok(enabledTools);
   assert.ok(enabledTools.includes("bash"));
@@ -117,9 +120,36 @@ test("idle Worker receives durable startup and wake-driven steering as Pi user m
   const steeringMessage = fake.messages[1];
   assert.ok(steeringMessage);
   assert.match(steeringMessage.text, /Steer the idle Worker/);
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 1);
+  await fake.handlers.get("agent_settled")?.();
   assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
 
   await fake.handlers.get("session_shutdown")?.();
+  store.close();
+});
+
+test("Worker replays a steering Message if Pi has not settled after queueing it", async () => {
+  const { store, taskId, workerId } = await fixture();
+  process.env.SWITCHYARD_TASK_ID = taskId;
+  process.env.SWITCHYARD_WORKER_ID = workerId;
+  enqueueMessage(store, taskId, "worker", "Do not lose this queued instruction");
+
+  const first = fakePi();
+  workerExtension(first.api);
+  await first.handlers.get("session_start")?.();
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 1);
+  await first.handlers.get("session_shutdown")?.();
+
+  const replacement = fakePi();
+  workerExtension(replacement.api);
+  await replacement.handlers.get("session_start")?.();
+  assert.equal(replacement.messages.length, 1);
+  assert.match(replacement.messages[0]?.text ?? "", /Do not lose this queued instruction/);
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 1);
+
+  await replacement.handlers.get("agent_settled")?.();
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
+  await replacement.handlers.get("session_shutdown")?.();
   store.close();
 });
 

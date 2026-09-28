@@ -103,6 +103,18 @@ export function taskSourceRoot(store: StateStore, task: TaskRecord): string {
   throw new Error(`task ${task.id} has no source checkout`);
 }
 
+export function markWorkspaceCleaned(store: StateStore, taskId: string): void {
+  store.transaction(() => {
+    const task = requiredTask(store, taskId);
+    if (!TERMINAL.has(task.state)) throw new Error("cannot clean a nonterminal Task Workspace");
+    if (!store.getWorkspace(taskId)) throw new Error("task workspace is missing");
+    const changed = store.db
+      .prepare("UPDATE workspaces SET provisioned=0 WHERE task_id=? AND provisioned=1")
+      .run(taskId);
+    if (changed.changes === 1) store.event(taskId, "workspace.cleaned");
+  });
+}
+
 export interface TaskStartupHooks {
   afterReservation?: () => void | Promise<void>;
   afterWorktreeProvisioned?: () => void | Promise<void>;
