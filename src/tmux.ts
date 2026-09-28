@@ -27,9 +27,9 @@ export function taskWindowName(
 }
 
 function tmuxLabel(value: string): string {
-  return value
-    .normalize("NFKD")
-    .replace(/[^\x00-\x7F]/g, "")
+  return Array.from(value.normalize("NFKD"))
+    .filter((character) => (character.codePointAt(0) ?? 0) <= 0x7f)
+    .join("")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
