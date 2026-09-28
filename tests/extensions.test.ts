@@ -12,6 +12,7 @@ import supervisorExtension from "../extensions/supervisor.ts";
 import workerExtension from "../extensions/worker.ts";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage, signalWake } from "../src/inbox.ts";
+import { beginReview } from "../src/review.ts";
 import { retireWorker } from "../src/runtime.ts";
 import { now, StateStore } from "../src/state.ts";
 import { createTask, transition } from "../src/tasks.ts";
@@ -175,18 +176,56 @@ test("Worker replays a steering Message if Pi has not settled after queueing it"
   store.close();
 });
 
-test("Reviewer receives an initial review request as a Pi user message", async () => {
-  process.env.SWITCHYARD_REVIEW_ID = "review-1";
+test("Reviewer receives exact candidate context as a Pi user message after startup", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-reviewer-ext-"));
+  dirs.push(root);
+  const repo = path.join(root, "repo");
+  await mkdir(repo);
+  await exec("git", ["init", "-b", "main"], { cwd: repo });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  await exec("git", ["config", "user.name", "SwitchYard Test"], { cwd: repo });
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await exec("git", ["add", "README.md"], { cwd: repo });
+  await exec("git", ["commit", "-m", "base"], { cwd: repo });
+  const { stdout: baseSha } = await exec("git", ["rev-parse", "HEAD"], { cwd: repo });
+  await writeFile(path.join(repo, "README.md"), "candidate\n");
+  await exec("git", ["add", "README.md"], { cwd: repo });
+  await exec("git", ["commit", "-m", "candidate"], { cwd: repo });
+  const { stdout: candidateSha } = await exec("git", ["rev-parse", "HEAD"], { cwd: repo });
+
+  const paths = await ensureSwitchYardHome({
+    ...process.env,
+    SWITCHYARD_HOME: path.join(root, "home"),
+  });
+  process.env.SWITCHYARD_HOME = paths.home;
+  const store = new StateStore(paths.database);
+  store.db
+    .prepare("INSERT INTO projects(id, name, root_path, created_at) VALUES ('p', 'sample', ?, ?)")
+    .run(repo, now());
+  const task = createTask(store, "p", "implement", "Review the exact candidate", "loop");
+  store.db
+    .prepare(
+      "UPDATE tasks SET state='reviewing', base_sha=?, candidate_sha=?, summary=?, verification_summary=? WHERE id=?",
+    )
+    .run(baseSha.trim(), candidateSha.trim(), "candidate ready", "checks passed", task.id);
+  const reviewId = await beginReview(store, paths, task.id);
+  process.env.SWITCHYARD_REVIEW_ID = reviewId;
+
   const fake = fakePi();
   reviewerExtension(fake.api);
-
   await fake.handlers.get("session_start")?.();
 
   assert.deepEqual(fake.activeTools.at(-1), ["read", "switchyard_submit_review"]);
   const initialMessage = fake.messages[0];
   assert.ok(initialMessage);
-  assert.match(initialMessage.text, /Begin the independent review/);
+  assert.match(initialMessage.text, /independent SwitchYard Reviewer/);
+  assert.match(initialMessage.text, /Review the exact candidate/);
+  assert.match(initialMessage.text, /Candidate diff:/);
+  assert.match(initialMessage.text, /candidate/);
   assert.deepEqual(initialMessage.options, { deliverAs: "steer" });
+
+  await fake.handlers.get("session_shutdown")?.();
+  store.close();
 });
 
 test("Supervisor replays a queued Message until Pi settles its steering", async () => {
