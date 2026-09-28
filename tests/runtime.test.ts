@@ -33,7 +33,7 @@ import {
   steerTask,
   submitCandidate,
 } from "../src/tasks.ts";
-import { windowAlive } from "../src/tmux.ts";
+import { taskWindowName, windowAlive } from "../src/tmux.ts";
 
 const exec = promisify(execFile);
 const dirs: string[] = [];
@@ -511,9 +511,10 @@ test("one Task recovery failure is recorded without blocking later Tasks", async
   store.db
     .prepare("UPDATE tasks SET created_at=? WHERE id=?")
     .run("2030-01-01T00:00:00.000Z", laterTask.id);
-  const brokenWorker = store.getLiveWorker(brokenTask.id);
-  assert.ok(brokenWorker);
-  await writeFile(failureFile, `${brokenWorker.tmux_window}\n`);
+  const project = store.getProject("p");
+  assert.ok(project);
+  const brokenWindow = taskWindowName("worker", project.name, brokenTask.title, brokenTask.id);
+  await writeFile(failureFile, `${brokenWindow}\n`);
   const { reconcile } = await import("../src/reconcile.ts");
 
   await reconcile(store, paths);
