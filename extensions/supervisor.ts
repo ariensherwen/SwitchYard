@@ -857,7 +857,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     try {
       const { paths, store } = await openSwitchYard();
       try {
-            await reconcile(store, paths);
+        await reconcile(store, paths);
         const rows = (
           store.db
             .prepare(
