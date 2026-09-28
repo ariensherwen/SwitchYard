@@ -2,60 +2,72 @@
 
 ## Project
 
-A Git repository registered with SwitchYard. A Project may own many Tasks.
+A named, registered Git checkout managed by SwitchYard. Registration stores its display name, canonical Git top-level real path, and optional source URL for an explicit clone. Generated SwitchYard worktrees and temporary Task source checkouts are not Projects. Implementation Tasks require a registered Project; remote investigation may use a temporary checkout without registration.
 
 ## Task
 
-A durable unit of requested work. A Task survives worker death or replacement and has at most one active Worker at a time.
-
-Initial task kinds are `implement` and `investigate`.
-
-Canonical lifecycle:
+A durable unit of requested work with a mutable human-facing title and immutable UUID identity. Kinds are `implement` and `investigate`. A Task uses either a registered Project or its own temporary source checkout.
 
 | From | Allowed transitions |
 | --- | --- |
-| `queued` | `running`, `failed`, `cancelled` |
-| `running` | `waiting`, `needs_decision`, `completed`, `failed`, `cancelled` |
+| `queued` | `starting`, `failed`, `cancelled` |
+| `starting` | `running`, `failed`, `cancelled` |
+| `running` | `waiting`, `needs_decision`, `reviewing`, `completed`, `failed`, `cancelled` |
 | `waiting` | `running`, `failed`, `cancelled` |
 | `needs_decision` | `running`, `failed`, `cancelled` |
+| `reviewing` | `running`, `needs_decision`, `completed`, `failed`, `cancelled` |
 | `completed` | none |
 | `failed` | none |
 | `cancelled` | none |
 
-`waiting` and `needs_decision` are resumable states. `completed`, `failed`, and `cancelled` are terminal. A Task may be cancelled from any nonterminal state, including `queued` before a Worker starts. A Task may fail from any nonterminal state, including startup or recovery failure before an active Worker exists.
-
-## Worker
-
-One Pi process executing a Task. A replacement Pi process is a new Worker. A Task may have multiple Workers over its lifetime, but never more than one active Worker.
+`completed`, `failed`, and `cancelled` are terminal. Terminal Tasks are never resurrected, and terminalizing a Task cancels its open Decision and aborts any running Review in the same transaction. `starting` covers durable Workspace reservation/provisioning and Worker startup. Recovery resumes `queued` Tasks and completes interrupted Workspace provisioning. `reviewing` means one candidate revision is under independent review.
 
 ## Workspace
 
-The Git worktree owned by a Task. The Workspace belongs to the Task, not the Worker. Worker failure and Task cancellation do not imply Workspace deletion.
+One Git worktree owned by one Task. Its path, branch, and base revision are reserved durably before Git creates it, then marked provisioned once creation is verified. The Workspace belongs to the Task, not a Worker, and survives Worker replacement and cancellation.
+
+## Worker
+
+One Pi process executing a Task. A replacement Pi process receives a new Worker identity and continues in the same Workspace. A Task may have many historical Workers but at most one active Worker.
+
+A Reviewer is not a Worker.
 
 ## Supervisor
 
-The primary Pi session controlling SwitchYard. The Supervisor may create, inspect, steer, cancel, and resolve decisions for Tasks. It does not directly implement work inside worker Workspaces.
+The primary Pi session controlling SwitchYard. It refers to Projects by name and Tasks by title or natural description, never requires Task or Decision IDs, and receives human-readable records without internal IDs. It delegates, inspects, steers, resolves Decisions, and cancels Tasks without directly taking Worker or Reviewer authority. Unknown Projects enter intake; remote implementation requires an explicit clone, Project name, and destination. Review-only intake starts an investigation from a temporary checkout without registering a Project.
 
 ## Message
 
-A durable steering instruction sent from the Supervisor to a Worker. Once messaging exists, Messages must be recorded before delivery.
+A durable steering or notification record. State is `pending` or `delivered`. Persistence precedes delivery; a missed wake signal does not lose the Message.
 
 ## Decision
 
-A durable unresolved question requiring an answer before a Task can proceed. A Decision is not a Message.
+A durable question that blocks a Task. State is `open`, `resolved`, or `cancelled`. Resolving a Decision atomically records the answer, resumes the Task, queues the answer Message, and records Events. Terminalizing its Task cancels an open Decision atomically.
+
+## Candidate revision
+
+The exact committed Git SHA submitted by a Worker as the result of an `implement` Task. Completion and review certification bind to this revision.
+
+## Review policy
+
+`off` or `loop`. `loop` is the default for `implement` Tasks and is supported only for that kind; `investigate` Tasks use `off`.
+
+## Review
+
+An independent evaluation of one exact candidate revision. States are `running`, `changes_requested`, `clean`, and `failed`. A clean Review certifies only its candidate SHA.
+
+## Finding
+
+An immutable actionable problem reported by one Review. A later Review determines whether a newer candidate is clean; old Findings are not rewritten based on Worker claims.
 
 ## Event
 
-An append-only audit record that something happened. Current state may be stored directly; SwitchYard is not required to be fully event-sourced. A durable state change and its corresponding Event must be committed in the same transaction so state and audit history cannot diverge.
+Append-only audit history. Current state is stored directly; SwitchYard is not fully event-sourced. A durable state transition and its corresponding Event commit in the same SQLite transaction.
 
 ## Pi session
 
 A Pi conversation/runtime instance. Use `Pi session` when plain `session` would be ambiguous.
 
-## tmux window
-
-A process host and visibility surface. A tmux window is not authoritative task state. Do not infer semantic task completion, waiting, or failure from rendered terminal text when Pi can provide structured information.
-
 ## tmux session
 
-A tmux process-hosting session. Use `tmux session` when plain `session` would be ambiguous.
+A process-hosting session namespaced by the canonical SwitchYard home. tmux is not semantic state: pane text never proves Task completion, waiting, failure, or Decision state.
