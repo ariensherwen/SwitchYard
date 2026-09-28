@@ -80,6 +80,7 @@ test("landing fast-forwards only the captured Project branch and preserves the T
 
 test("landing ignores ignored files in an otherwise clean Project checkout", async () => {
   const { repo, store, taskId, candidateSha } = await fixture();
+  await mkdir(path.join(repo, ".git", "info"), { recursive: true });
   await writeFile(path.join(repo, ".git", "info", "exclude"), "ignored.tmp\n");
   await writeFile(path.join(repo, "ignored.tmp"), "ignored\n");
   assert.equal(await git(repo, ["status", "--porcelain"]), "");
