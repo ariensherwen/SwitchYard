@@ -26,6 +26,7 @@ interface ToolSpec {
 }
 
 const MINIMUM_NODE_VERSION = [22, 19, 0] as const;
+const MINIMUM_PI_VERSION = [0, 87, 1] as const;
 
 const TOOL_SPECS: ToolSpec[] = [
   {
@@ -33,7 +34,7 @@ const TOOL_SPECS: ToolSpec[] = [
     command: "node",
     args: ["--version"],
     parseVersion: (output) => output.trim().replace(/^v/, ""),
-    validate: validateNodeVersion,
+    validate: (version) => validateMinimum(version, MINIMUM_NODE_VERSION, "Node"),
   },
   {
     tool: "git",
@@ -51,16 +52,14 @@ const TOOL_SPECS: ToolSpec[] = [
     tool: "pi",
     command: "pi",
     args: ["--version"],
-    parseVersion: (output) => output.trim(),
+    parseVersion: (output) => output.trim().replace(/^v/, ""),
+    validate: (version) => validateMinimum(version, MINIMUM_PI_VERSION, "Pi"),
   },
 ];
 
 export async function runDoctor(env: NodeJS.ProcessEnv = process.env): Promise<DoctorReport> {
   const checks = await Promise.all(TOOL_SPECS.map((spec) => checkTool(spec, env)));
-  return {
-    ok: checks.every((check) => check.ok),
-    checks,
-  };
+  return { ok: checks.every((check) => check.ok), checks };
 }
 
 async function checkTool(spec: ToolSpec, env: NodeJS.ProcessEnv): Promise<DoctorCheck> {
@@ -69,32 +68,14 @@ async function checkTool(spec: ToolSpec, env: NodeJS.ProcessEnv): Promise<Doctor
       env,
       windowsHide: true,
     });
-    const output = `${stdout}${stderr}`.trim();
-    const version = spec.parseVersion(output);
-
+    const version = spec.parseVersion(`${stdout}${stderr}`.trim());
     if (!version) {
-      return {
-        tool: spec.tool,
-        ok: false,
-        error: "version command returned no version",
-      };
+      return { tool: spec.tool, ok: false, error: "version command returned no version" };
     }
-
-    const validationError = spec.validate?.(version);
-    if (validationError) {
-      return {
-        tool: spec.tool,
-        ok: false,
-        version,
-        error: validationError,
-      };
-    }
-
-    return {
-      tool: spec.tool,
-      ok: true,
-      version,
-    };
+    const error = spec.validate?.(version);
+    return error
+      ? { tool: spec.tool, ok: false, version, error }
+      : { tool: spec.tool, ok: true, version };
   } catch (error) {
     return {
       tool: spec.tool,
@@ -104,43 +85,27 @@ async function checkTool(spec: ToolSpec, env: NodeJS.ProcessEnv): Promise<Doctor
   }
 }
 
-function validateNodeVersion(version: string): string | undefined {
+function validateMinimum(
+  version: string,
+  minimum: readonly [number, number, number],
+  name: string,
+): string | undefined {
   const parsed = parseSemverCore(version);
-  if (!parsed) {
-    return `unrecognized Node version: ${version}`;
-  }
-
-  if (compareVersion(parsed, MINIMUM_NODE_VERSION) < 0) {
-    return "requires Node >= 22.19.0";
-  }
-
-  return undefined;
+  if (!parsed) return `unrecognized ${name} version: ${version}`;
+  return compareVersion(parsed, minimum) < 0
+    ? `requires ${name} >= ${minimum.join(".")}`
+    : undefined;
 }
 
 function parseSemverCore(version: string): readonly [number, number, number] | undefined {
   const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
-  if (!match) {
-    return undefined;
-  }
-
-  const [, major, minor, patch] = match;
-  if (major === undefined || minor === undefined || patch === undefined) {
-    return undefined;
-  }
-
-  return [Number(major), Number(minor), Number(patch)];
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
 }
 
-function compareVersion(
-  left: readonly [number, number, number],
-  right: readonly [number, number, number],
-): number {
-  for (const index of [0, 1, 2] as const) {
-    const delta = left[index] - right[index];
-    if (delta !== 0) {
-      return delta;
-    }
+function compareVersion(left: readonly number[], right: readonly number[]): number {
+  for (let index = 0; index < 3; index++) {
+    const delta = (left[index] ?? 0) - (right[index] ?? 0);
+    if (delta) return delta;
   }
-
   return 0;
 }

@@ -1,35 +1,26 @@
 # Project
 
-SwitchYard is a Pi-first, tmux-first local coding-agent control plane. It supervises Pi workers in tmux, gives tasks isolated Git worktrees, and will persist durable task state locally.
+SwitchYard is a Pi-first, tmux-first local orchestration control plane using durable SQLite state and task-owned Git worktrees.
 
-# Current scope
+# Scope
 
-Build for these concrete dependencies:
-
-- Pi
-- tmux
-- Git worktrees
-- SQLite
-- Linux and macOS
-- TypeScript/Node.js
-
-Do not generalize around hypothetical future harnesses, terminals, workspace providers, or runtime backends. Add an abstraction only when real variation exists or an external dependency needs a deterministic test seam.
+Build for Pi, tmux, Git worktrees, SQLite, TypeScript/Node.js, Linux, and macOS. Do not introduce generic agent, terminal, runtime, forge, workspace, or review-provider abstractions until real variation exists.
 
 # Domain
 
-`CONTEXT.md` is the canonical domain glossary. Use its terms and invariants instead of redefining Project, Task, Worker, Workspace, Supervisor, Message, Decision, Event, Pi session, or tmux session here.
+`CONTEXT.md` is the canonical glossary and lifecycle contract. Keep Task state changes behind domain operations; callers must not assign lifecycle state ad hoc.
 
 # Design rules
 
-- Prefer deep modules with small interfaces that own sequencing and invariants.
-- Put seams around real variation only.
-- Keep lifecycle state explicit and typed.
-- Keep runtime correctness in code, not prompts.
-- Treat tmux as process hosting and visibility, never authoritative semantic state.
-- Keep shell commands thin; task lifecycle, recovery, authorization, and durable state belong in TypeScript.
-- Preserve unlanded work. Cleanup must not destroy a task-owned workspace without proving it is safe.
-- Use Pi TypeScript extensions for executable Pi integration when that integration lands.
-- Test behavior through the same production interfaces used by the application.
+- Runtime code owns lifecycle invariants; prompts do not.
+- Persist Messages, Decision answers, Findings, and state transitions before delivery.
+- State transitions use compare-and-set semantics and pair with Events in the same transaction.
+- A Task Workspace belongs to the Task and survives Worker replacement or cancellation.
+- Pi role extensions must preserve authority separation.
+- Review certification is bound to the current candidate SHA and a clean isolated review checkout.
+- Recovery must use normal domain operations where possible and must never resurrect terminal Tasks.
+- tmux hosts processes and provides visibility; terminal text is not authoritative state.
+- Cleanup must positively prove that no unlanded work will be destroyed.
 
 # Workflow
 
@@ -37,15 +28,14 @@ Do not generalize around hypothetical future harnesses, terminals, workspace pro
 ./scripts/run-ci.sh
 ```
 
-This is the local acceptance gate and should stay aligned with GitHub CI.
+Run CI locally through this script. Do not add or depend on GitHub Actions CI.
+
+For real Pi/tmux acceptance:
+
+```sh
+SWITCHYARD_LIVE=1 ./scripts/run-live-e2e.sh
+```
 
 # Documentation
 
-- Implementation and tests are authoritative for behavior.
-- `CONTEXT.md` owns domain terminology and invariants.
-- `README.md` is the human entry point.
-- `pi-warden.md` contains enforcement rules only.
-- Do not duplicate implementation walkthroughs into root documentation.
-- Update documentation when public behavior or contracts change.
-
-Keep root documentation lean. Do not add implementation history, roadmap dumps, or speculative architecture manuals.
+Keep root documentation lean. `README.md` is the user entry point, `CONTEXT.md` owns terminology/invariants, and `pi-warden.md` contains independently enforceable rules. Do not add roadmap dumps or speculative architecture manuals.
