@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 const extension = (name: string) => readFile(path.resolve("extensions", `${name}.ts`), "utf8");
 
-test("Supervisor exposes only supervisor control tools", async () => {
+test("Supervisor adds lifecycle controls without clamping the user's Pi tools", async () => {
   const text = await extension("supervisor");
   for (const name of [
     "switchyard_delegate",
@@ -16,7 +16,9 @@ test("Supervisor exposes only supervisor control tools", async () => {
     "switchyard_cancel_task",
   ])
     assert.match(text, new RegExp(name));
-  assert.match(text, /pi\.setActiveTools\(SUPERVISOR_TOOLS\)/);
+  assert.doesNotMatch(text, /pi\.setActiveTools\(/);
+  assert.doesNotMatch(text, /const SUPERVISOR_TOOLS/);
+  assert.doesNotMatch(text, /Supervisor authority is limited to SwitchYard control tools/);
   assert.doesNotMatch(text, /switchyard_complete/);
   assert.doesNotMatch(text, /switchyard_submit_review/);
 });
