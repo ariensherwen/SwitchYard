@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { promisify } from "node:util";
 import { resolveSwitchYardHome } from "./home.ts";
@@ -9,7 +10,8 @@ export function tmuxSessionForHome(home: string): string {
   const leaf = tmuxLabel(path.basename(canonicalHome));
   const parent = tmuxLabel(path.basename(path.dirname(canonicalHome)));
   const context = leaf === "switchyard" ? parent : [parent, leaf].filter(Boolean).join("-");
-  return `switchyard-${context || "default"}`;
+  const suffix = createHash("sha256").update(canonicalHome).digest("hex").slice(0, 6);
+  return `switchyard-${context || "default"}-${suffix}`;
 }
 
 export function taskWindowName(
