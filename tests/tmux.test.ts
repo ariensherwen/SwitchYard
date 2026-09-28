@@ -9,8 +9,14 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 const session = `switchyard-test-${process.pid}`;
 process.env.SWITCHYARD_TMUX_SESSION = session;
-const { attachWindow, killWindow, resolveTmuxSession, showWindowReadOnly, windowAlive } =
-  await import("../src/tmux.ts");
+const {
+  attachWindow,
+  killWindow,
+  resolveTmuxSession,
+  showWindowReadOnly,
+  taskWindowName,
+  windowAlive,
+} = await import("../src/tmux.ts");
 const hasTmux = await exec("tmux", ["-V"]).then(
   () => true,
   () => false,
@@ -24,11 +30,24 @@ test("default tmux sessions are isolated by SwitchYard home", () => {
   const first = resolveTmuxSession({ SWITCHYARD_HOME: "/tmp/switchyard-one" });
   const second = resolveTmuxSession({ SWITCHYARD_HOME: "/tmp/switchyard-two" });
   assert.notEqual(first, second);
+  assert.match(first, /switchyard-one/);
+  assert.match(second, /switchyard-two/);
   assert.equal(
     resolveTmuxSession({ SWITCHYARD_HOME: "/tmp/switchyard-one/..//switchyard-one" }),
     first,
   );
   assert.equal(resolveTmuxSession({ SWITCHYARD_TMUX_SESSION: "explicit" }), "explicit");
+});
+
+test("Worker and Reviewer window names are human-readable", () => {
+  assert.match(
+    taskWindowName("worker", "KhmerOCR API", "Make Postgres authoritative", "abcdef12-3456"),
+    /^worker-khmerocr-api-make-postgres-authoritative-abcdef/,
+  );
+  assert.match(
+    taskWindowName("review", "SwitchYard", "Liaison supervisor", "12345678-90ab"),
+    /^review-switchyard-liaison-supervisor-123456/,
+  );
 });
 
 test("Worker observation uses a live read-only tmux popup instead of switching panes", async () => {

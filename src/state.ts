@@ -132,6 +132,7 @@ export interface EventRecord {
 }
 
 const SCHEMA_VERSION = 10;
+const MAX_READABLE_SCHEMA_VERSION = 11;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -305,12 +306,12 @@ export class StateStore {
 
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
-    if (row.user_version > SCHEMA_VERSION) {
+    if (row.user_version > MAX_READABLE_SCHEMA_VERSION) {
       throw new Error(
-        `database schema ${row.user_version} is newer than supported ${SCHEMA_VERSION}`,
+        `database schema ${row.user_version} is newer than supported ${MAX_READABLE_SCHEMA_VERSION}`,
       );
     }
-    if (row.user_version === SCHEMA_VERSION) return;
+    if (row.user_version >= SCHEMA_VERSION) return;
 
     this.transaction(() => {
       if (row.user_version === 0) {

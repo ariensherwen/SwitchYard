@@ -6,6 +6,7 @@ import { enqueueMessage } from "./inbox.ts";
 import type { StateStore } from "./state.ts";
 import { now } from "./state.ts";
 import { casTransition } from "./tasks.ts";
+import { taskWindowName } from "./tmux.ts";
 import {
   changedPaths,
   createReviewWorktree,
@@ -41,7 +42,7 @@ export async function beginReview(
   if (!project) throw new Error("review requires a registered Project");
   const id = randomUUID();
   const reviewPath = path.join(paths.reviews, taskId, id);
-  const tmuxWindow = `review-${taskId}-${id}`;
+  const tmuxWindow = taskWindowName("review", project.name, task.title, id);
   const review = store.transaction(() => {
     const currentTask = store.getTask(taskId);
     if (currentTask?.state !== "reviewing" || currentTask.candidate_sha !== candidateSha)

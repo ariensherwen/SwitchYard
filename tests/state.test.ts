@@ -46,6 +46,23 @@ test("migrations are repeatable and durable", async () => {
   reopened.close();
 });
 
+test("schema 11 from an additive pre-release build remains readable", async () => {
+  const store = await fixture();
+  const fixtureDir = dirs.at(-1);
+  assert.ok(fixtureDir);
+  const dbPath = path.join(fixtureDir, "switchyard.db");
+  store.db.exec("PRAGMA user_version = 11");
+  store.close();
+
+  const reopened = new StateStore(dbPath);
+  assert.equal(
+    (reopened.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+    11,
+  );
+  assert.equal(reopened.listAllProjects().length, 1);
+  reopened.close();
+});
+
 test("schema migration reserves one active Review per candidate", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "switchyard-state-v1-"));
   dirs.push(dir);

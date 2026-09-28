@@ -1,13 +1,36 @@
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import path from "node:path";
 import { promisify } from "node:util";
 import { resolveSwitchYardHome } from "./home.ts";
 
 const execFileAsync = promisify(execFile);
 export function tmuxSessionForHome(home: string): string {
   const canonicalHome = resolveSwitchYardHome({ SWITCHYARD_HOME: home });
-  const namespace = createHash("sha256").update(canonicalHome).digest("hex").slice(0, 12);
-  return `switchyard-${namespace}`;
+  const leaf = tmuxLabel(path.basename(canonicalHome));
+  const parent = tmuxLabel(path.basename(path.dirname(canonicalHome)));
+  const context = leaf === "switchyard" ? parent : [parent, leaf].filter(Boolean).join("-");
+  return `switchyard-${context || "default"}`;
+}
+
+export function taskWindowName(
+  role: "worker" | "review",
+  projectName: string,
+  taskTitle: string,
+  id: string,
+): string {
+  const project = tmuxLabel(projectName).slice(0, 24);
+  const task = tmuxLabel(taskTitle).slice(0, 40);
+  const suffix = tmuxLabel(id).slice(0, 6);
+  return `${role}-${project || "project"}-${task || "task"}-${suffix || "run"}`.slice(0, 100);
+}
+
+function tmuxLabel(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[^\x00-\x7F]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 export function resolveTmuxSession(env: NodeJS.ProcessEnv = process.env): string {

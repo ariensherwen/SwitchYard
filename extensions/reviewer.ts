@@ -1,6 +1,7 @@
 import { openSwitchYard } from "../src/context.ts";
 import { type ReviewSubmission, submitReview } from "../src/review.ts";
 import { quiesceTaskRuntimes, replaceWorker, wakeSupervisor, wakeWorker } from "../src/runtime.ts";
+import { changedPaths, diffText } from "../src/worktree.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
 import { enumSchema, objectSchema, stringArraySchema, stringSchema } from "./schema.ts";
 
@@ -66,10 +67,31 @@ export default function reviewerExtension(pi: PiExtensionApi) {
 
   pi.on("session_start", async () => {
     pi.setActiveTools(REVIEWER_TOOLS);
-    await pi.sendUserMessage(
-      "Begin the independent review using the candidate context in your instructions. Submit exactly one structured result with switchyard_submit_review.",
-      { deliverAs: "steer" },
-    );
+    const { store } = await openSwitchYard();
+    try {
+      const review = store.getReview(reviewId);
+      if (!review) throw new Error("review not found");
+      const task = store.getTask(review.task_id);
+      if (!task?.base_sha) throw new Error("review Task/base is missing");
+      const pathsChanged = await changedPaths(review.path, task.base_sha, review.candidate_sha);
+      const diff = await diffText(review.path, task.base_sha, review.candidate_sha);
+      await pi.sendUserMessage(
+        [
+          `You are an independent SwitchYard Reviewer for task ${task.title}.`,
+          "Do not modify files. Review only the exact detached candidate revision in your current directory.",
+          `Original instruction:\n${task.instruction}`,
+          `Worker completion summary:\n${task.summary ?? "(none)"}`,
+          `Worker verification summary:\n${task.verification_summary ?? "(none)"}`,
+          `Candidate SHA: ${review.candidate_sha}`,
+          `Changed paths:\n${pathsChanged.join("\n") || "(none)"}`,
+          `Candidate diff:\n${diff || "(empty diff)"}`,
+          "Submit exactly one structured result with switchyard_submit_review.",
+        ].join("\n\n"),
+        { deliverAs: "steer" },
+      );
+    } finally {
+      store.close();
+    }
   });
   pi.on("session_shutdown", async () => {
     pi.setActiveTools([]);

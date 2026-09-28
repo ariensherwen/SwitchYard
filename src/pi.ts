@@ -18,7 +18,7 @@ export function buildPiLaunch(
   prompt?: string,
 ): PiLaunch {
   const extension = path.join(PACKAGE_ROOT, "extensions", `${role}.ts`);
-  const args = ["pi", "--no-extensions", "-e", extension];
+  const args = ["pi", "-e", extension];
   if (prompt) args.push("--append-system-prompt", prompt);
   return {
     cwd,

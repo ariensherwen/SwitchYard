@@ -422,45 +422,17 @@ test("Supervisor can rename a Task through its natural description without expos
   store.close();
 });
 
-test("Supervisor and Reviewer authority is mechanically allowlisted", async () => {
+test("Supervisor preserves the user's Pi tool setup", async () => {
   const supervisor = fakePi();
   supervisorExtension(supervisor.api);
-  // The allowlist is applied on session_start; use an empty durable home.
   const root = await mkdtemp(path.join(os.tmpdir(), "switchyard-role-"));
   dirs.push(root);
   process.env.SWITCHYARD_HOME = path.join(root, "home");
   await supervisor.handlers.get("session_start")?.();
-  const active = supervisor.activeTools.at(-1);
-  assert.ok(active);
-  assert.deepEqual(
-    active.sort(),
-    [
-      "switchyard_add_remote",
-      "switchyard_cancel_task",
-      "switchyard_create_project",
-      "switchyard_delegate",
-      "switchyard_get_project",
-      "switchyard_get_task",
-      "switchyard_land_task",
-      "switchyard_list_projects",
-      "switchyard_list_remotes",
-      "switchyard_list_tasks",
-      "switchyard_publish_task",
-      "switchyard_register_project",
-      "switchyard_relocate_project",
-      "switchyard_remove_remote",
-      "switchyard_rename_project",
-      "switchyard_resolve_decision",
-      "switchyard_resolve_remote_revision",
-      "switchyard_rename_task",
-      "switchyard_send_message",
-      "switchyard_show_reviewer",
-      "switchyard_show_worker",
-      "switchyard_unregister_project",
-      "switchyard_update_remote",
-    ].sort(),
-  );
-  assert.equal(active.includes("bash"), false);
-  assert.equal(active.includes("edit"), false);
+
+  assert.equal(supervisor.activeTools.length, 0);
+  assert.equal(supervisor.handlers.has("tool_call"), false);
+  assert.ok(supervisor.getTool("switchyard_delegate"));
+  assert.ok(supervisor.getTool("switchyard_land_task"));
   await supervisor.handlers.get("session_shutdown")?.();
 });

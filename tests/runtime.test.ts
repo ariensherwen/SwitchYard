@@ -9,6 +9,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage } from "../src/inbox.ts";
+import { buildPiLaunch } from "../src/pi.ts";
 import { beginReview } from "../src/review.ts";
 import {
   quiesceTaskRuntimes,
@@ -75,6 +76,13 @@ async function fixture() {
   process.env.PATH = `${bin}:${originalPath}`;
   return { paths, store, stateFile, failureFile };
 }
+
+test("Pi role launches preserve the user's configured extensions", () => {
+  const launch = buildPiLaunch("worker", "/tmp/workspace");
+  assert.equal(launch.command.includes("--no-extensions"), false);
+  assert.equal(launch.command[0], "pi");
+  assert.equal(launch.command[1], "-e");
+});
 
 test("transient investigation uses a cloned source without registering a Project", async () => {
   const { paths, store } = await fixture();

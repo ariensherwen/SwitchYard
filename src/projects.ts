@@ -15,7 +15,7 @@ import {
   currentBranch,
   currentHead,
   moveRepository,
-  projectHasChanges,
+  projectChanges,
   registerGitIdentity,
   removeGitRemote,
   repositoryRemotes,
@@ -158,15 +158,18 @@ export async function inspectProject(
   head: string;
   branch: string;
   dirty: boolean;
+  changes: Awaited<ReturnType<typeof projectChanges>>;
   remotes: Awaited<ReturnType<typeof repositoryRemotes>>;
 }> {
   const project = requiredProject(store, projectId);
   const root = await validateProjectCheckout(store, project);
+  const changes = await projectChanges(root);
   return {
     project: requiredProject(store, projectId),
     head: await currentHead(root),
     branch: await currentBranch(root),
-    dirty: await projectHasChanges(root),
+    dirty: changes.length > 0,
+    changes,
     remotes: await repositoryRemotes(root),
   };
 }

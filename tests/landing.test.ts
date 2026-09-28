@@ -78,6 +78,25 @@ test("landing fast-forwards only the captured Project branch and preserves the T
   store.close();
 });
 
+test("landing ignores ignored files in an otherwise clean Project checkout", async () => {
+  const { repo, store, taskId, candidateSha } = await fixture();
+  await writeFile(path.join(repo, ".git", "info", "exclude"), "ignored.tmp\n");
+  await writeFile(path.join(repo, "ignored.tmp"), "ignored\n");
+  assert.equal(await git(repo, ["status", "--porcelain"]), "");
+
+  const landed = await landCompletedTask(store, taskId);
+  assert.equal(landed.status, "landed");
+  assert.equal(await git(repo, ["rev-parse", "HEAD"]), candidateSha);
+  store.close();
+});
+
+test("landing reports the actual dirty paths when refusing", async () => {
+  const { repo, store, taskId } = await fixture();
+  await writeFile(path.join(repo, "local.txt"), "local-only\n");
+  await assert.rejects(() => landCompletedTask(store, taskId), /\?\? local\.txt/);
+  store.close();
+});
+
 test("landing refuses an advanced Project without rewriting either side", async () => {
   const { repo, store, taskId, candidateSha, baseSha } = await fixture();
   await writeFile(path.join(repo, "other.txt"), "another change\n");

@@ -4,7 +4,7 @@ import { markWorkspaceCleaned } from "./tasks.ts";
 import {
   canSafelyClean,
   fastForwardOnly,
-  projectIsSafeLandingTarget,
+  projectChanges,
   removeWorktree,
   validateImplementCandidate,
 } from "./worktree.ts";
@@ -51,8 +51,13 @@ export async function landCompletedTask(store: StateStore, taskId: string): Prom
   );
   if (candidate !== task.candidate_sha)
     throw new Error("Task Workspace no longer points at its completed candidate");
-  if (!(await projectIsSafeLandingTarget(projectRoot)))
-    throw new Error(`${project.name} has local changes; landing requires a clean Project checkout`);
+  const localChanges = await projectChanges(projectRoot);
+  if (localChanges.length) {
+    const details = localChanges.map((change) => `${change.status} ${change.path}`).join("\n");
+    throw new Error(
+      `${project.name} has local changes; landing requires a clean Project checkout:\n${details}`,
+    );
+  }
 
   const outcome = await fastForwardOnly(projectRoot, task.base_sha, candidate);
   if (outcome.status === "diverged") {

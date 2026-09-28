@@ -11,8 +11,8 @@ import {
   taskSourceRoot,
   terminateActiveReviews,
 } from "./tasks.ts";
-import { ensureWindow, killWindow, windowAlive } from "./tmux.ts";
-import { changedPaths, diffText, removeWorktree } from "./worktree.ts";
+import { ensureWindow, killWindow, taskWindowName, windowAlive } from "./tmux.ts";
+import { removeWorktree } from "./worktree.ts";
 
 export async function startWorker(
   store: StateStore,
@@ -236,7 +236,15 @@ function reserveWorker(
   replacement: boolean,
 ): { worker: WorkerRecord; created: boolean } {
   const workerId = randomUUID();
-  const window = `task-${taskId}`;
+  const taskForName = store.getTask(taskId);
+  if (!taskForName) throw new Error(`task not found: ${taskId}`);
+  const projectForName = taskForName.project_id ? store.getProject(taskForName.project_id) : undefined;
+  const window = taskWindowName(
+    "worker",
+    projectForName?.name ?? taskForName.source_label ?? "transient",
+    taskForName.title,
+    taskForName.id,
+  );
   let created = false;
   store.transaction(() => {
     const task = store.getTask(taskId);
@@ -504,31 +512,12 @@ export async function startReviewer(
   let spawned = false;
   try {
     const task = store.getTask(review.task_id);
-    const workspace = store.getWorkspace(review.task_id);
-    if (!task?.base_sha || !workspace) throw new Error("task/base/workspace not found");
-    const pathsChanged = await changedPaths(workspace.path, task.base_sha, review.candidate_sha);
-    const diff = await diffText(workspace.path, task.base_sha, review.candidate_sha);
-    const prompt = [
-      `You are an independent SwitchYard Reviewer for task ${task.id}.`,
-      "Do not modify files. Review only the exact detached candidate revision in your current directory.",
-      `Original instruction:\n${task.instruction}`,
-      `Worker completion summary:\n${task.summary ?? "(none)"}`,
-      `Worker verification summary:\n${task.verification_summary ?? "(none)"}`,
-      `Candidate SHA: ${review.candidate_sha}`,
-      `Changed paths:\n${pathsChanged.join("\n") || "(none)"}`,
-      `Candidate diff:\n${diff || "(empty diff)"}`,
-      "Submit exactly one structured result with switchyard_submit_review.",
-    ].join("\n\n");
-    const launch = buildPiLaunch(
-      "reviewer",
-      review.path,
-      {
-        SWITCHYARD_HOME: paths.home,
-        SWITCHYARD_TASK_ID: task.id,
-        SWITCHYARD_REVIEW_ID: reviewId,
-      },
-      prompt,
-    );
+    if (!task) throw new Error("review Task is missing");
+    const launch = buildPiLaunch("reviewer", review.path, {
+      SWITCHYARD_HOME: paths.home,
+      SWITCHYARD_TASK_ID: task.id,
+      SWITCHYARD_REVIEW_ID: reviewId,
+    });
     await hooks.beforeLaunch?.();
     assertReviewerStartupClaim(store, review, startupToken);
     await ensureWindow(review.tmux_window, launch.cwd, shellCommand(launch));

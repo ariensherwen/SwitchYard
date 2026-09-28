@@ -13,6 +13,11 @@ export interface WorkspaceInfo {
   baseSha: string;
 }
 
+export interface WorkingTreeChange {
+  status: string;
+  path: string;
+}
+
 export async function canonicalRepositoryRoot(input: string): Promise<string> {
   const absolute = path.resolve(input);
   const { stdout } = await git(absolute, ["rev-parse", "--show-toplevel"]);
@@ -122,14 +127,23 @@ export async function assertProjectClean(root: string): Promise<void> {
   if (await projectHasChanges(root)) throw new Error(`project checkout is dirty: ${root}`);
 }
 
+export async function projectChanges(root: string): Promise<WorkingTreeChange[]> {
+  const { stdout } = await git(root, ["status", "--porcelain=v1"]);
+  return stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => ({
+      status: line.slice(0, 2),
+      path: line.slice(3),
+    }));
+}
+
 export async function projectHasChanges(root: string): Promise<boolean> {
-  const { stdout } = await git(root, ["status", "--porcelain"]);
-  return stdout.trim().length > 0;
+  return (await projectChanges(root)).length > 0;
 }
 
 export async function projectIsSafeLandingTarget(root: string): Promise<boolean> {
-  const { stdout } = await git(root, ["status", "--porcelain", "--ignored"]);
-  return stdout.trim().length === 0;
+  return !(await projectHasChanges(root));
 }
 
 export async function resolveCommit(root: string, revision: string): Promise<string> {

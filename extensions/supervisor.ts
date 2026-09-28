@@ -80,32 +80,6 @@ interface ResolveDecisionParams extends TaskParams {
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
-const SUPERVISOR_TOOLS = [
-  "switchyard_list_projects",
-  "switchyard_get_project",
-  "switchyard_register_project",
-  "switchyard_create_project",
-  "switchyard_rename_project",
-  "switchyard_unregister_project",
-  "switchyard_relocate_project",
-  "switchyard_list_remotes",
-  "switchyard_add_remote",
-  "switchyard_update_remote",
-  "switchyard_remove_remote",
-  "switchyard_resolve_remote_revision",
-  "switchyard_delegate",
-  "switchyard_list_tasks",
-  "switchyard_get_task",
-  "switchyard_send_message",
-  "switchyard_resolve_decision",
-  "switchyard_cancel_task",
-  "switchyard_rename_task",
-  "switchyard_land_task",
-  "switchyard_publish_task",
-  "switchyard_show_worker",
-  "switchyard_show_reviewer",
-];
-
 export default function supervisorExtension(pi: PiExtensionApi) {
   let stopWakePump: (() => void) | undefined;
   let delivering = false;
@@ -883,8 +857,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     try {
       const { paths, store } = await openSwitchYard();
       try {
-        pi.setActiveTools(SUPERVISOR_TOOLS);
-        await reconcile(store, paths);
+            await reconcile(store, paths);
         const rows = (
           store.db
             .prepare(
@@ -914,14 +887,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     }
   }
 
-  pi.on("tool_call", async (event) => {
-    const toolName = (event as { toolName?: string } | undefined)?.toolName;
-    if (!toolName || SUPERVISOR_TOOLS.includes(toolName)) return undefined;
-    return { block: true, reason: "Supervisor authority is limited to SwitchYard control tools." };
-  });
-
   pi.on("session_start", async () => {
-    pi.setActiveTools(SUPERVISOR_TOOLS);
     const { paths, store } = await openSwitchYard();
     try {
       stopWakePump ??= startWakePump(
@@ -1124,6 +1090,7 @@ async function projectDetails(
       ...projectView(facts.project),
       branch: facts.branch,
       dirty: facts.dirty,
+      changes: facts.changes,
       remotes: facts.remotes,
       recent_tasks,
     };
