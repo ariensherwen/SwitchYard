@@ -511,7 +511,9 @@ test("one Task recovery failure is recorded without blocking later Tasks", async
   store.db
     .prepare("UPDATE tasks SET created_at=? WHERE id=?")
     .run("2030-01-01T00:00:00.000Z", laterTask.id);
-  await writeFile(failureFile, `task-${brokenTask.id}\n`);
+  const brokenWorker = store.getLiveWorker(brokenTask.id);
+  assert.ok(brokenWorker);
+  await writeFile(failureFile, `${brokenWorker.tmux_window}\n`);
   const { reconcile } = await import("../src/reconcile.ts");
 
   await reconcile(store, paths);
