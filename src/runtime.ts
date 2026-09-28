@@ -238,7 +238,9 @@ function reserveWorker(
   const workerId = randomUUID();
   const taskForName = store.getTask(taskId);
   if (!taskForName) throw new Error(`task not found: ${taskId}`);
-  const projectForName = taskForName.project_id ? store.getProject(taskForName.project_id) : undefined;
+  const projectForName = taskForName.project_id
+    ? store.getProject(taskForName.project_id)
+    : undefined;
   const window = taskWindowName(
     "worker",
     projectForName?.name ?? taskForName.source_label ?? "transient",
