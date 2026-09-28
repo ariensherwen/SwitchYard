@@ -41,7 +41,7 @@ async function fixture() {
     SWITCHYARD_HOME: path.join(root, "home"),
   });
   const store = new StateStore(paths.database);
-  const task = createTransientInvestigation(
+  const task = await createTransientInvestigation(
     store,
     paths,
     source,
@@ -67,13 +67,53 @@ async function fixture() {
   };
 }
 
-test("remote refs must resolve to one full commit SHA", async () => {
-  const { source, revision, store } = await fixture();
+test("remote refs and annotated tags pin the commit used by the transient checkout", async () => {
+  const { paths, source, revision, store } = await fixture();
+  await exec("git", ["tag", "-a", "v1", "-m", "release"], { cwd: source });
   assert.equal(await resolveRemoteRevision(source, "refs/heads/main"), revision);
+  assert.equal(await resolveRemoteRevision(source, "refs/tags/v1"), revision);
   await assert.rejects(
     () => resolveRemoteRevision(source, "refs/heads/missing"),
     /did not resolve to one concrete Git commit/,
   );
+  const taggedTask = await createTransientInvestigation(
+    store,
+    paths,
+    source,
+    "Inspect the annotated release",
+    "Annotated release",
+    source,
+    revision,
+    "refs/tags/v1",
+  );
+  await startTask(store, paths, taggedTask.id);
+  assert.equal(store.getTask(taggedTask.id)?.source_revision, revision);
+  assert.equal(store.getWorkspace(taggedTask.id)?.provisioned, 1);
+  store.close();
+});
+
+test("transient creation rejects a source ref that resolves to another revision", async () => {
+  const { paths, source, store } = await fixture();
+  await exec("git", ["switch", "-c", "release"], { cwd: source });
+  await writeFile(path.join(source, "source.txt"), "release source\\n");
+  await exec("git", ["commit", "-am", "release"], { cwd: source });
+  const releaseRevision = (await exec("git", ["rev-parse", "HEAD"], { cwd: source })).stdout.trim();
+
+  await assert.rejects(
+    () =>
+      createTransientInvestigation(
+        store,
+        paths,
+        source,
+        "Inspect the mismatched ref",
+        "Mismatched provenance",
+        "Mismatched provenance",
+        releaseRevision,
+        "refs/heads/main",
+      ),
+    /source ref does not resolve to the supplied commit SHA/,
+  );
+  assert.equal(store.listTasks().length, 1);
   store.close();
 });
 

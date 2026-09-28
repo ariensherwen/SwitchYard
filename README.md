@@ -31,7 +31,7 @@ You: Yes.
 Supervisor: I started “Fix Kinetix issue #142”. It will go through implementation review before I report completion.
 ```
 
-The Supervisor can register, create, rename, inspect, relocate, and unregister Projects; manage Git remotes; start and steer Tasks; resolve Decisions; and show live Worker or Reviewer panes. Worker and Reviewer panes are observational: send steering and answer Decisions through the Supervisor. It uses Project names and Task titles rather than internal IDs. If a name is ambiguous, it asks you to choose.
+The Supervisor can register, create, rename, inspect, relocate, and unregister Projects; manage Git remotes; start and steer Tasks; resolve Decisions; and show live Worker or Reviewer panes. Pane viewing uses a read-only popup; press q to return. Send steering and answer Decisions through the Supervisor. It uses Project names and Task titles rather than internal IDs. If a name is ambiguous, it asks you to choose.
 
 Implementation Tasks run the review loop by default. Investigation Tasks use a pinned, temporary checkout and cannot submit source changes. Remote implementation requires consent to clone and register a Project. Inspecting a remote without registering it requires a concrete commit SHA.
 

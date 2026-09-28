@@ -63,17 +63,29 @@ export async function moveRepository(source: string, destination: string): Promi
 }
 
 export async function resolveRemoteRevision(remoteUrl: string, ref: string): Promise<string> {
-  if (!ref.trim()) throw new Error("remote Git ref is required");
-  const { stdout } = await git(process.cwd(), ["ls-remote", "--", remoteUrl, ref.trim()]);
+  const selectedRef = ref.trim();
+  if (!selectedRef) throw new Error("remote Git ref is required");
+  const peeledRef = `${selectedRef}^{}`;
+  const { stdout } = await git(process.cwd(), [
+    "ls-remote",
+    "--",
+    remoteUrl,
+    selectedRef,
+    peeledRef,
+  ]);
   const matches = stdout
     .split(/\r?\n/)
     .map((line) => line.trim().split(/\s+/))
-    .filter((parts) => parts.length >= 2 && parts[1] === ref.trim());
-  const revisions = [
-    ...new Set(
-      matches.map((parts) => parts[0]?.toLowerCase()).filter((value): value is string => !!value),
-    ),
-  ];
+    .filter((parts) => parts.length >= 2);
+  const peeledRevisions = matches
+    .filter((parts) => parts[1] === peeledRef)
+    .map((parts) => parts[0]?.toLowerCase())
+    .filter((value): value is string => !!value);
+  const directRevisions = matches
+    .filter((parts) => parts[1] === selectedRef)
+    .map((parts) => parts[0]?.toLowerCase())
+    .filter((value): value is string => !!value);
+  const revisions = [...new Set(peeledRevisions.length ? peeledRevisions : directRevisions)];
   if (revisions.length !== 1 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(revisions[0] ?? ""))
     throw new Error("remote ref did not resolve to one concrete Git commit");
   return revisions[0] as string;

@@ -81,7 +81,7 @@ test("transient investigation uses a cloned source without registering a Project
   const sourcePath = path.join(path.dirname(paths.home), "repo");
   const sourceUrl = pathToFileURL(sourcePath).href;
   const { stdout: revision } = await exec("git", ["rev-parse", "HEAD"], { cwd: sourcePath });
-  const task = createTransientInvestigation(
+  const task = await createTransientInvestigation(
     store,
     paths,
     sourceUrl,

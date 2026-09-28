@@ -50,6 +50,8 @@ export async function addProject(
     .listAllProjects()
     .filter((project) => project.git_identity === identity);
   const movedIdentity = !existing && identityMatches.length === 1 ? identityMatches[0] : undefined;
+  if (existing?.relocation_token || movedIdentity?.relocation_token)
+    throw new Error("cannot register or repair a Project while it is being relocated");
   if (
     identityMatches.some((project) => project.id !== existing?.id) &&
     (!movedIdentity || existsSync(movedIdentity.root_path))
@@ -188,12 +190,16 @@ export async function renameProject(
 
 export function unregisterProject(store: StateStore, projectId: string): ProjectRecord {
   const project = requiredProject(store, projectId);
+  if (project.relocation_token)
+    throw new Error("cannot unregister a Project while it is being relocated");
   const active = activeTasks(store, projectId);
   if (active.length)
     throw new Error(
       `cannot unregister a Project with active Tasks: ${active.map((task) => task.title).join(", ")}`,
     );
   store.transaction(() => {
+    if (requiredProject(store, projectId).relocation_token)
+      throw new Error("cannot unregister a Project while it is being relocated");
     const changed = store.db
       .prepare(
         "UPDATE projects SET registration_state='unregistered' WHERE id=? AND registration_state='registered'",
@@ -205,33 +211,20 @@ export function unregisterProject(store: StateStore, projectId: string): Project
   return requiredProject(store, projectId);
 }
 
+interface ProjectRelocationHooks {
+  afterReservation?: () => void | Promise<void>;
+}
+
 export async function relocateProject(
   store: StateStore,
   paths: SwitchYardPaths,
   projectId: string,
   destinationInput: string,
+  hooks: ProjectRelocationHooks = {},
 ): Promise<ProjectRecord> {
   const project = requiredProject(store, projectId);
   if (project.registration_state !== "registered")
     throw new Error("unregistered Projects cannot be relocated");
-  const active = activeTasks(store, projectId);
-  if (active.length)
-    throw new Error(
-      `cannot relocate a Project with active Tasks: ${active.map((task) => task.title).join(", ")}`,
-    );
-  const workspaceTasks = store
-    .listTasks()
-    .filter((task) => task.project_id === projectId)
-    .filter((task) => {
-      const workspace = store.getWorkspace(task.id);
-      return (
-        workspace?.provisioned === 1 || (workspace !== undefined && existsSync(workspace.path))
-      );
-    });
-  if (workspaceTasks.length)
-    throw new Error(
-      `cannot relocate a Project with retained Task Workspaces: ${workspaceTasks.map((task) => task.title).join(", ")}`,
-    );
   const root = await validateProjectCheckout(store, project);
   const destination = resolveUserPath(destinationInput);
   await assertDestinationOutsideManagedRoots(paths, destination);
@@ -241,23 +234,102 @@ export async function relocateProject(
     throw new Error("Project destination cannot be inside its current checkout");
   if (existsSync(destination))
     throw new Error(`Project destination already exists: ${destination}`);
-  await mkdir(path.dirname(destination), { recursive: true });
-  await moveRepository(root, destination);
+
+  const token = reserveProjectRelocation(store, projectId, root, destination);
+  let moved = false;
   try {
+    await hooks.afterReservation?.();
+    await mkdir(path.dirname(destination), { recursive: true });
+    await moveRepository(root, destination);
+    moved = true;
     const movedRoot = await canonicalRepositoryRoot(destination);
     const identity = await registerGitIdentity(movedRoot, project.git_identity);
     store.transaction(() => {
       const changed = store.db
-        .prepare("UPDATE projects SET root_path=?, git_identity=? WHERE id=? AND root_path=?")
-        .run(movedRoot, identity, projectId, root);
-      if (changed.changes !== 1) throw new Error("Project location changed concurrently");
+        .prepare(`UPDATE projects SET root_path=?, git_identity=?, relocation_token=NULL,
+          relocation_destination=NULL, relocation_pid=NULL
+          WHERE id=? AND root_path=? AND relocation_token=?`)
+        .run(movedRoot, identity, projectId, root, token);
+      if (changed.changes !== 1) throw new Error("Project location reservation was lost");
       store.event(null, "project.relocated", { project_id: projectId, from: root, to: movedRoot });
     });
   } catch (error) {
-    if (existsSync(destination) && !existsSync(root)) await moveRepository(destination, root);
+    if (moved && existsSync(destination) && !existsSync(root)) {
+      try {
+        await moveRepository(destination, root);
+        moved = false;
+      } catch (rollbackError) {
+        store.transaction(() =>
+          store.event(null, "project.relocation_recovery_required", {
+            project_id: projectId,
+            from: root,
+            to: destination,
+            failure: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+          }),
+        );
+        throw new Error("Project relocation failed and its checkout could not be restored");
+      }
+    }
+    releaseProjectRelocation(store, projectId, token, error);
     throw error;
   }
   return requiredProject(store, projectId);
+}
+
+export async function recoverProjectRelocations(store: StateStore): Promise<void> {
+  for (const project of store.listAllProjects()) {
+    if (!project.relocation_token || processIsAlive(project.relocation_pid)) continue;
+    const destination = project.relocation_destination;
+    if (!destination) continue;
+    const sourceExists = existsSync(project.root_path);
+    const destinationExists = existsSync(destination);
+    if (sourceExists === destinationExists) continue;
+
+    const survivingPath = sourceExists ? project.root_path : destination;
+    try {
+      const root = await canonicalRepositoryRoot(survivingPath);
+      const identity = await registerGitIdentity(root, project.git_identity);
+      store.transaction(() => {
+        const current = requiredProject(store, project.id);
+        if (current.relocation_token !== project.relocation_token) return;
+        if (sourceExists) {
+          const changed = store.db
+            .prepare(`UPDATE projects SET relocation_token=NULL, relocation_destination=NULL,
+              relocation_pid=NULL WHERE id=? AND relocation_token=?`)
+            .run(project.id, project.relocation_token);
+          if (changed.changes === 1)
+            store.event(null, "project.relocation_aborted", {
+              project_id: project.id,
+              from: project.root_path,
+              to: destination,
+              recovered: true,
+            });
+          return;
+        }
+        const changed = store.db
+          .prepare(`UPDATE projects SET root_path=?, git_identity=?, relocation_token=NULL,
+            relocation_destination=NULL, relocation_pid=NULL WHERE id=? AND root_path=?
+            AND relocation_token=?`)
+          .run(root, identity, project.id, project.root_path, project.relocation_token);
+        if (changed.changes !== 1) throw new Error("Project relocation reservation changed");
+        store.event(null, "project.relocated", {
+          project_id: project.id,
+          from: project.root_path,
+          to: root,
+          recovered: true,
+        });
+      });
+    } catch (error) {
+      store.transaction(() =>
+        store.event(null, "project.relocation_recovery_failed", {
+          project_id: project.id,
+          from: project.root_path,
+          to: destination,
+          failure: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }
 }
 
 export async function listProjectRemotes(
@@ -393,10 +465,80 @@ export function isRemoteGitUrl(value: string): boolean {
   }
 }
 
+function processIsAlive(pid: number | null): boolean {
+  if (pid === null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function activeTasks(store: StateStore, projectId: string): TaskRecord[] {
   return store
     .listTasks()
     .filter((task) => task.project_id === projectId && !TERMINAL.has(task.state));
+}
+
+function reserveProjectRelocation(
+  store: StateStore,
+  projectId: string,
+  root: string,
+  destination: string,
+): string {
+  const token = randomUUID();
+  store.transaction(() => {
+    const project = requiredProject(store, projectId);
+    if (project.registration_state !== "registered")
+      throw new Error("unregistered Projects cannot be relocated");
+    if (project.root_path !== root) throw new Error("Project location changed concurrently");
+    if (project.relocation_token) throw new Error("Project is already being relocated");
+    const active = activeTasks(store, projectId);
+    if (active.length)
+      throw new Error(
+        `cannot relocate a Project with active Tasks: ${active.map((task) => task.title).join(", ")}`,
+      );
+    const workspaces = retainedWorkspaceTasks(store, projectId);
+    if (workspaces.length)
+      throw new Error(
+        `cannot relocate a Project with retained Task Workspaces: ${workspaces.map((task) => task.title).join(", ")}`,
+      );
+    const changed = store.db
+      .prepare(`UPDATE projects SET relocation_token=?, relocation_destination=?, relocation_pid=?
+        WHERE id=? AND root_path=? AND registration_state='registered' AND relocation_token IS NULL`)
+      .run(token, destination, process.pid, projectId, root);
+    if (changed.changes !== 1) throw new Error("Project relocation reservation failed");
+    store.event(null, "project.relocation_started", {
+      project_id: projectId,
+      from: root,
+      to: destination,
+    });
+  });
+  return token;
+}
+
+function releaseProjectRelocation(
+  store: StateStore,
+  projectId: string,
+  token: string,
+  error: unknown,
+): void {
+  store.transaction(() => {
+    const project = store.getProject(projectId);
+    if (!project) return;
+    const changed = store.db
+      .prepare(`UPDATE projects SET relocation_token=NULL, relocation_destination=NULL,
+        relocation_pid=NULL WHERE id=? AND relocation_token=?`)
+      .run(projectId, token);
+    if (changed.changes === 1)
+      store.event(null, "project.relocation_aborted", {
+        project_id: projectId,
+        from: project.root_path,
+        to: project.relocation_destination,
+        failure: error instanceof Error ? error.message : String(error),
+      });
+  });
 }
 
 function retainedWorkspaceTasks(store: StateStore, projectId: string): TaskRecord[] {

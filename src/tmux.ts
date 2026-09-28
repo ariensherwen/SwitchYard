@@ -105,6 +105,37 @@ export async function attachWindow(window: string): Promise<number> {
   });
 }
 
+export async function showWindowReadOnly(window: string): Promise<void> {
+  const windowId = await findWindowId(window);
+  if (!windowId) throw new Error(`tmux window not found: ${window}`);
+  if (!/^@[0-9]+$/.test(windowId)) throw new Error("tmux returned an invalid window identifier");
+  const viewer = [
+    'const { spawnSync } = require("node:child_process");',
+    "const target = process.argv[1];",
+    'const draw = () => { const pane = spawnSync("tmux", ["capture-pane", "-e", "-p", "-t", target], { encoding: "utf8" }); process.stdout.write("\\x1b[H\\x1b[2J" + (pane.status === 0 ? pane.stdout : pane.stderr ?? "Unable to capture pane") + "\\nRead-only view; press q to return."); };',
+    "if (process.stdin.isTTY) process.stdin.setRawMode(true);",
+    "process.stdin.resume();",
+    'process.stdin.on("data", key => { if (key.includes(113)) process.exit(0); });',
+    "draw(); setInterval(draw, 750);",
+  ].join("");
+  const command = `${shellQuote(process.execPath)} -e ${shellQuote(viewer)} ${windowId}`;
+  await tmux([
+    "display-popup",
+    "-E",
+    "-w",
+    "100%",
+    "-h",
+    "100%",
+    "-T",
+    "Read-only pane — press q to return",
+    command,
+  ]);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 async function tmux(args: string[]): Promise<{ stdout: string; stderr: string }> {
   return await execFileAsync("tmux", args, { windowsHide: true });
 }

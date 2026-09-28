@@ -14,6 +14,7 @@ import {
   ensureTaskWorkspace,
   ensureTransientRepository,
   removeWorktree,
+  resolveRemoteRevision,
   taskWorkspaceBase,
   validateImplementCandidate,
   validateInvestigateCompletion,
@@ -54,6 +55,8 @@ export function createTask(
   const id = randomUUID();
   const timestamp = now();
   store.transaction(() => {
+    if (store.getProject(projectId)?.relocation_token)
+      throw new Error("cannot create a Task while its Project is being relocated");
     store.db
       .prepare(`INSERT INTO tasks(
         id, project_id, title, kind, instruction, review_policy, base_ref, dirty_acknowledged,
@@ -76,7 +79,7 @@ export function createTask(
   return requiredTask(store, id);
 }
 
-export function createTransientInvestigation(
+export async function createTransientInvestigation(
   store: StateStore,
   paths: SwitchYardPaths,
   sourceUrl: string,
@@ -85,12 +88,18 @@ export function createTransientInvestigation(
   sourceLabel = sourceUrl,
   sourceRevision?: string,
   sourceRef?: string,
-): TaskRecord {
+): Promise<TaskRecord> {
   if (!sourceUrl.trim()) throw new Error("transient source URL is required");
   if (!sourceRevision) throw new Error("transient source requires a resolved commit SHA");
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sourceRevision))
     throw new Error("transient source revision must be a full Git commit SHA");
   if (!title.trim()) throw new Error("task title is required");
+  const selectedRef = sourceRef?.trim() || undefined;
+  if (selectedRef) {
+    const resolvedRevision = await resolveRemoteRevision(sourceUrl, selectedRef);
+    if (resolvedRevision !== sourceRevision.toLowerCase())
+      throw new Error("transient source ref does not resolve to the supplied commit SHA");
+  }
   const id = randomUUID();
   const timestamp = now();
   const sourcePath = path.join(paths.sources, id);
@@ -108,7 +117,7 @@ export function createTransientInvestigation(
           ? sourceLabel.trim()
           : humanSourceLabel(sourceUrl),
         sourceRevision?.toLowerCase() ?? null,
-        sourceRef ?? null,
+        selectedRef ?? null,
         title.trim(),
         instruction,
         timestamp,
@@ -119,7 +128,7 @@ export function createTransientInvestigation(
       review: "off",
       transient_source: true,
       source_revision: sourceRevision?.toLowerCase() ?? null,
-      source_ref: sourceRef ?? null,
+      source_ref: selectedRef ?? null,
     });
   });
   return requiredTask(store, id);
@@ -297,6 +306,7 @@ export async function startTask(
     );
     store.transaction(() => {
       const current = requiredTask(store, taskId);
+      if (current.project_id) assertProjectNotRelocating(store, current.project_id, sourceRoot);
       if (current.state === "queued") {
         casTransition(store, taskId, "queued", "starting");
         if (!store.getWorkspace(taskId)) {
@@ -350,6 +360,7 @@ export async function startTask(
       ));
     store.transaction(() => {
       const current = requiredTask(store, taskId);
+      if (current.project_id) assertProjectNotRelocating(store, current.project_id, sourceRoot);
       if (current.state === "starting" && !store.getWorkspace(taskId)) {
         store.db
           .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
@@ -721,6 +732,21 @@ export function terminateActiveReviews(
       store.event(taskId, "review.aborted", { review_id: review.id, task_state: terminalState });
     }
   }
+}
+
+function assertProjectNotRelocating(
+  store: StateStore,
+  projectId: string,
+  startupRoot: string,
+): void {
+  const project = store.getProject(projectId);
+  if (!project) throw new Error(`project not found: ${projectId}`);
+  if (project.relocation_token)
+    throw new Error(`Project ${project.name} is being relocated; retry Task startup afterward`);
+  if (project.root_path !== startupRoot)
+    throw new Error(
+      `Project ${project.name} moved during Task startup; retry with its current checkout`,
+    );
 }
 
 function requiredTask(store: StateStore, taskId: string): TaskRecord {

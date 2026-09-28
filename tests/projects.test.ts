@@ -9,11 +9,12 @@ import { ensureSwitchYardHome } from "../src/home.ts";
 import {
   addProject,
   createProject,
+  recoverProjectRelocations,
   relocateProject,
   renameProject,
   unregisterProject,
 } from "../src/projects.ts";
-import { StateStore } from "../src/state.ts";
+import { now, StateStore } from "../src/state.ts";
 import { cancelTask, createTask, startTask } from "../src/tasks.ts";
 
 const exec = promisify(execFile);
@@ -100,6 +101,72 @@ test("rename and relocation preserve the registered Project identity", async () 
   );
   assert.equal(await git(relocated.root_path, ["rev-parse", "HEAD"]), head);
   assert.equal(store.getProject(project.id)?.registration_state, "registered");
+  store.close();
+});
+
+test("Task startup cannot provision a Workspace during Project relocation", async () => {
+  const { root, paths, store } = await fixture();
+  const repo = await initRepo(path.join(root, "repo"));
+  const project = await addProject(store, paths, repo, "Kinetix");
+  let signalReserved!: () => void;
+  let releaseRelocation!: () => void;
+  const reserved = new Promise<void>((resolve) => {
+    signalReserved = resolve;
+  });
+  const relocationGate = new Promise<void>((resolve) => {
+    releaseRelocation = resolve;
+  });
+  const relocation = relocateProject(store, paths, project.id, path.join(root, "moved"), {
+    afterReservation: async () => {
+      signalReserved();
+      await relocationGate;
+    },
+  });
+  await reserved;
+
+  const concurrentStore = new StateStore(paths.database);
+  assert.throws(
+    () => createTask(concurrentStore, project.id, "implement", "change something", "off"),
+    /while its Project is being relocated/,
+  );
+  const taskId = "stale-writer-task";
+  concurrentStore.transaction(() => {
+    concurrentStore.db
+      .prepare(`INSERT INTO tasks(
+        id, project_id, title, kind, instruction, review_policy, state, created_at, updated_at
+      ) VALUES (?, ?, ?, 'implement', ?, 'off', 'queued', ?, ?)`)
+      .run(taskId, project.id, "Stale writer", "change something", now(), now());
+  });
+  await assert.rejects(() => startTask(concurrentStore, paths, taskId), /is being relocated/);
+  assert.equal(concurrentStore.getWorkspace(taskId), undefined);
+  releaseRelocation();
+  const moved = await relocation;
+  assert.equal(moved.root_path, path.join(root, "moved"));
+  await startTask(concurrentStore, paths, taskId);
+  assert.equal(concurrentStore.getWorkspace(taskId)?.provisioned, 1);
+  concurrentStore.close();
+  store.close();
+});
+
+test("recovery completes a Project move interrupted after the filesystem rename", async () => {
+  const { root, paths, store } = await fixture();
+  const repo = await initRepo(path.join(root, "repo"));
+  const project = await addProject(store, paths, repo, "Kinetix");
+  const moved = path.join(root, "moved");
+  const token = "interrupted-relocation";
+  await rename(repo, moved);
+  store.transaction(() => {
+    store.db
+      .prepare(`UPDATE projects SET relocation_token=?, relocation_destination=?, relocation_pid=?
+        WHERE id=?`)
+      .run(token, moved, 1_000_000_000, project.id);
+  });
+
+  await recoverProjectRelocations(store);
+  const recovered = store.getProject(project.id);
+  assert.equal(recovered?.root_path, moved);
+  assert.equal(recovered?.relocation_token, null);
+  assert.ok(store.listEvents().some((event) => event.type === "project.relocated"));
   store.close();
 });
 

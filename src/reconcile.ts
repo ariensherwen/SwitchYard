@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import type { SwitchYardPaths } from "./home.ts";
+import { recoverProjectRelocations } from "./projects.ts";
 import { beginReview, recordReviewRuntimeFailure } from "./review.ts";
 import {
   cleanupFinishedReviewRuntime,
@@ -16,7 +17,9 @@ import { windowAlive } from "./tmux.ts";
 const TERMINAL = new Set<TaskState>(["completed", "failed", "cancelled"]);
 
 export async function reconcile(store: StateStore, paths: SwitchYardPaths): Promise<void> {
+  await recoverProjectRelocations(store);
   for (const task of store.listTasks()) {
+    if (task.project_id && store.getProject(task.project_id)?.relocation_token) continue;
     try {
       await reconcileTask(store, paths, task);
     } catch (error) {

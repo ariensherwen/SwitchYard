@@ -452,7 +452,6 @@ test("Supervisor and Reviewer authority is mechanically allowlisted", async () =
       "switchyard_rename_project",
       "switchyard_resolve_decision",
       "switchyard_resolve_remote_revision",
-      "switchyard_return_to_supervisor",
       "switchyard_rename_task",
       "switchyard_send_message",
       "switchyard_show_reviewer",

@@ -39,7 +39,7 @@ import {
   steerTask,
   updateTaskTitle,
 } from "../src/tasks.ts";
-import { attachWindow } from "../src/tmux.ts";
+import { showWindowReadOnly } from "../src/tmux.ts";
 import { projectHasChanges, resolveRemoteRevision } from "../src/worktree.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
 import {
@@ -104,7 +104,6 @@ const SUPERVISOR_TOOLS = [
   "switchyard_publish_task",
   "switchyard_show_worker",
   "switchyard_show_reviewer",
-  "switchyard_return_to_supervisor",
 ];
 
 export default function supervisorExtension(pi: PiExtensionApi) {
@@ -485,7 +484,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
                   "Resolve the requested remote ref to a concrete commit SHA before starting transient work.",
               });
             }
-            const task = createTransientInvestigation(
+            const task = await createTransientInvestigation(
               store,
               paths,
               params.project,
@@ -820,7 +819,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     name: "switchyard_show_worker",
     label: "Show Worker",
     description:
-      "Switch the tmux client to a Worker window. This is navigation only and does not steer, stop, or replace the Worker.",
+      "Open a live, read-only tmux popup showing the Worker pane. Press q in the popup to return; input is never sent to the Worker.",
     parameters: objectSchema({ task: stringSchema() }, ["task"]),
     async execute(_id: string, params: TaskParams) {
       const { store } = await openSwitchYard();
@@ -830,8 +829,8 @@ export default function supervisorExtension(pi: PiExtensionApi) {
         const worker = store.getLiveWorker(match.task.id);
         if (!worker)
           return result({ status: "no_live_worker", task: taskReference(store, match.task) });
-        await attachWindow(worker.tmux_window);
-        return result({ status: "showing_worker", task: taskReference(store, match.task) });
+        await showWindowReadOnly(worker.tmux_window);
+        return result({ status: "worker_viewed", task: taskReference(store, match.task) });
       } finally {
         store.close();
       }
@@ -841,7 +840,8 @@ export default function supervisorExtension(pi: PiExtensionApi) {
   pi.registerTool({
     name: "switchyard_show_reviewer",
     label: "Show Reviewer",
-    description: "Switch the tmux client to the active Reviewer window. This is navigation only.",
+    description:
+      "Open a live, read-only tmux popup showing the Reviewer pane. Press q in the popup to return; input is never sent to the Reviewer.",
     parameters: objectSchema({ task: stringSchema() }, ["task"]),
     async execute(_id: string, params: TaskParams) {
       const { store } = await openSwitchYard();
@@ -851,23 +851,11 @@ export default function supervisorExtension(pi: PiExtensionApi) {
         const review = store.getLatestReview(match.task.id);
         if (review?.state !== "running")
           return result({ status: "no_active_reviewer", task: taskReference(store, match.task) });
-        await attachWindow(review.tmux_window);
-        return result({ status: "showing_reviewer", task: taskReference(store, match.task) });
+        await showWindowReadOnly(review.tmux_window);
+        return result({ status: "reviewer_viewed", task: taskReference(store, match.task) });
       } finally {
         store.close();
       }
-    },
-  });
-
-  pi.registerTool({
-    name: "switchyard_return_to_supervisor",
-    label: "Return to Supervisor",
-    description:
-      "Switch the tmux client back to the Supervisor window without changing runtime state.",
-    parameters: objectSchema({}),
-    async execute() {
-      await attachWindow("supervisor");
-      return result({ status: "showing_supervisor" });
     },
   });
 

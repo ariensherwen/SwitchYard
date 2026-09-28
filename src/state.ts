@@ -22,6 +22,9 @@ export interface ProjectRecord {
   remote_url: string | null;
   registration_state: "registered" | "unregistered";
   git_identity: string | null;
+  relocation_token: string | null;
+  relocation_destination: string | null;
+  relocation_pid: number | null;
   created_at: string;
 }
 
@@ -128,7 +131,7 @@ export interface EventRecord {
   created_at: string;
 }
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -622,6 +625,17 @@ export class StateStore {
             WHEN NEW.dirty_acknowledged IS NOT OLD.dirty_acknowledged
             BEGIN SELECT RAISE(ABORT, 'task dirty-checkout acknowledgement is immutable'); END;
           PRAGMA user_version = 9;
+        `);
+      });
+    }
+
+    if (row.user_version <= 9) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE projects ADD COLUMN relocation_token TEXT;
+          ALTER TABLE projects ADD COLUMN relocation_destination TEXT;
+          ALTER TABLE projects ADD COLUMN relocation_pid INTEGER;
+          PRAGMA user_version = 10;
         `);
       });
     }
