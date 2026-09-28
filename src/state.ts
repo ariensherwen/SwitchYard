@@ -20,6 +20,8 @@ export interface ProjectRecord {
   name: string;
   root_path: string;
   remote_url: string | null;
+  registration_state: "registered" | "unregistered";
+  git_identity: string | null;
   created_at: string;
 }
 
@@ -28,6 +30,11 @@ export interface TaskRecord {
   project_id: string | null;
   source_path: string | null;
   source_url: string | null;
+  source_label: string | null;
+  source_ref: string | null;
+  source_revision: string | null;
+  base_ref: string | null;
+  dirty_acknowledged: number;
   title: string;
   kind: TaskKind;
   instruction: string;
@@ -121,7 +128,7 @@ export interface EventRecord {
   created_at: string;
 }
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 9;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -173,6 +180,14 @@ export class StateStore {
   }
 
   listProjects(): ProjectRecord[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM projects WHERE registration_state='registered' ORDER BY created_at, id",
+      )
+      .all() as unknown as ProjectRecord[];
+  }
+
+  listAllProjects(): ProjectRecord[] {
     return this.db
       .prepare("SELECT * FROM projects ORDER BY created_at, id")
       .all() as unknown as ProjectRecord[];
@@ -535,6 +550,78 @@ export class StateStore {
           ALTER TABLE workers ADD COLUMN runtime_startup_token TEXT;
           ALTER TABLE reviews ADD COLUMN runtime_startup_token TEXT;
           PRAGMA user_version = 5;
+        `);
+      });
+    }
+
+    if (row.user_version <= 5) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE projects ADD COLUMN registration_state TEXT NOT NULL DEFAULT 'registered'
+            CHECK(registration_state IN ('registered','unregistered'));
+          ALTER TABLE projects ADD COLUMN git_identity TEXT;
+          ALTER TABLE tasks ADD COLUMN source_label TEXT;
+          ALTER TABLE tasks ADD COLUMN source_revision TEXT;
+          ALTER TABLE tasks ADD COLUMN base_ref TEXT;
+          ALTER TABLE tasks ADD COLUMN dirty_acknowledged INTEGER NOT NULL DEFAULT 0
+            CHECK(dirty_acknowledged IN (0,1));
+          CREATE TRIGGER tasks_review_policy_insert
+            BEFORE INSERT ON tasks WHEN NEW.review_policy='loop' AND NEW.kind!='implement'
+            BEGIN SELECT RAISE(ABORT, 'review loop is supported only for implement tasks'); END;
+          CREATE TRIGGER tasks_review_policy_update
+            BEFORE UPDATE OF kind, review_policy ON tasks
+            WHEN NEW.review_policy='loop' AND NEW.kind!='implement'
+            BEGIN SELECT RAISE(ABORT, 'review loop is supported only for implement tasks'); END;
+          CREATE TRIGGER tasks_base_sha_immutable
+            BEFORE UPDATE OF base_sha ON tasks
+            WHEN OLD.base_sha IS NOT NULL AND NEW.base_sha IS NOT OLD.base_sha
+            BEGIN SELECT RAISE(ABORT, 'task base SHA is immutable'); END;
+          PRAGMA user_version = 6;
+        `);
+      });
+    }
+
+    if (row.user_version <= 6) {
+      this.transaction(() => {
+        this.db.exec(`
+          ALTER TABLE tasks ADD COLUMN source_ref TEXT;
+          PRAGMA user_version = 7;
+        `);
+      });
+    }
+
+    if (row.user_version <= 7) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TRIGGER tasks_base_ref_immutable
+            BEFORE UPDATE OF base_ref ON tasks
+            WHEN OLD.base_ref IS NOT NULL AND NEW.base_ref IS NOT OLD.base_ref
+            BEGIN SELECT RAISE(ABORT, 'task base ref is immutable'); END;
+          PRAGMA user_version = 8;
+        `);
+      });
+    }
+
+    if (row.user_version <= 8) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TRIGGER tasks_source_url_immutable
+            BEFORE UPDATE OF source_url ON tasks
+            WHEN OLD.source_url IS NOT NULL AND NEW.source_url IS NOT OLD.source_url
+            BEGIN SELECT RAISE(ABORT, 'task source URL is immutable'); END;
+          CREATE TRIGGER tasks_source_revision_immutable
+            BEFORE UPDATE OF source_revision ON tasks
+            WHEN OLD.source_revision IS NOT NULL AND NEW.source_revision IS NOT OLD.source_revision
+            BEGIN SELECT RAISE(ABORT, 'task source revision is immutable'); END;
+          CREATE TRIGGER tasks_source_ref_immutable
+            BEFORE UPDATE OF source_ref ON tasks
+            WHEN OLD.source_ref IS NOT NULL AND NEW.source_ref IS NOT OLD.source_ref
+            BEGIN SELECT RAISE(ABORT, 'task source ref is immutable'); END;
+          CREATE TRIGGER tasks_dirty_acknowledgement_immutable
+            BEFORE UPDATE OF dirty_acknowledged ON tasks
+            WHEN NEW.dirty_acknowledged IS NOT OLD.dirty_acknowledged
+            BEGIN SELECT RAISE(ABORT, 'task dirty-checkout acknowledgement is immutable'); END;
+          PRAGMA user_version = 9;
         `);
       });
     }

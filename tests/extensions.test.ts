@@ -129,6 +129,27 @@ test("idle Worker receives durable startup and wake-driven steering as Pi user m
   store.close();
 });
 
+test("investigation Workers have read-only authority", async () => {
+  const { store, taskId, workerId } = await fixture();
+  store.db.prepare("UPDATE tasks SET kind='investigate' WHERE id=?").run(taskId);
+  process.env.SWITCHYARD_TASK_ID = taskId;
+  process.env.SWITCHYARD_WORKER_ID = workerId;
+  const fake = fakePi();
+  workerExtension(fake.api);
+  await fake.handlers.get("session_start")?.();
+  const tools = fake.activeTools.at(-1) ?? [];
+  assert.ok(tools.includes("read"));
+  assert.equal(tools.includes("bash"), false);
+  assert.equal(tools.includes("edit"), false);
+  assert.equal(tools.includes("write"), false);
+  const guard = (await fake.handlers.get("tool_call")?.({ toolName: "bash" })) as
+    | { block?: boolean }
+    | undefined;
+  assert.equal(guard?.block, true);
+  await fake.handlers.get("session_shutdown")?.();
+  store.close();
+});
+
 test("Worker replays a steering Message if Pi has not settled after queueing it", async () => {
   const { store, taskId, workerId } = await fixture();
   process.env.SWITCHYARD_TASK_ID = taskId;
@@ -241,11 +262,11 @@ test("Supervisor contract uses natural Task references and omits internal record
 
   const listed = (await listTool.execute("call", {})) as { details: unknown };
   const found = (await getTool.execute("call", { task: "sample durable instruction" })) as {
-    details: { project: string; task: string; state: string; failure: string };
+    details: { project: string; task: string; status: string; failure: string };
   };
   assert.equal(found.details.project, "sample");
   assert.match(found.details.task, /durable instruction/);
-  assert.equal(found.details.state, "waiting");
+  assert.equal(found.details.status, "Waiting for input");
   assert.equal(found.details.failure, "an internal identifier");
   for (const value of [listed.details, found.details]) {
     const serialized = JSON.stringify(value);
@@ -357,14 +378,17 @@ test("review-only remote investigation uses a transient checkout without Project
     project: string;
     kind: "implement" | "investigate";
     instruction: string;
+    source_revision: string;
     remote_action: "review_only";
   }>("switchyard_delegate");
   assert.ok(delegate);
 
+  const { stdout: sourceRevision } = await exec("git", ["rev-parse", "HEAD"], { cwd: remote });
   const response = (await delegate.execute("call", {
     project: remoteUrl,
     kind: "investigate",
     instruction: "Inspect the remote source",
+    source_revision: sourceRevision.trim(),
     remote_action: "review_only",
   })) as { details: { status: string; registered: boolean; task_started: boolean } };
 
@@ -382,6 +406,22 @@ test("review-only remote investigation uses a transient checkout without Project
   store.close();
 });
 
+test("Supervisor can rename a Task through its natural description without exposing identity", async () => {
+  const { store, taskId } = await fixture();
+  const supervisor = fakePi();
+  supervisorExtension(supervisor.api);
+  const rename = supervisor.getTool<{ task: string; title: string }>("switchyard_rename_task");
+  assert.ok(rename);
+  const response = (await rename.execute("call", {
+    task: "Do the durable instruction",
+    title: "Fix Kinetix search",
+  })) as { details: { task: string }; content: Array<{ text: string }> };
+  assert.equal(response.details.task, "Fix Kinetix search");
+  assert.equal(store.getTask(taskId)?.title, "Fix Kinetix search");
+  assert.doesNotMatch(response.content[0]?.text ?? "", new RegExp(taskId));
+  store.close();
+});
+
 test("Supervisor and Reviewer authority is mechanically allowlisted", async () => {
   const supervisor = fakePi();
   supervisorExtension(supervisor.api);
@@ -395,12 +435,30 @@ test("Supervisor and Reviewer authority is mechanically allowlisted", async () =
   assert.deepEqual(
     active.sort(),
     [
+      "switchyard_add_remote",
       "switchyard_cancel_task",
+      "switchyard_create_project",
       "switchyard_delegate",
+      "switchyard_get_project",
       "switchyard_get_task",
+      "switchyard_land_task",
+      "switchyard_list_projects",
+      "switchyard_list_remotes",
       "switchyard_list_tasks",
+      "switchyard_publish_task",
+      "switchyard_register_project",
+      "switchyard_relocate_project",
+      "switchyard_remove_remote",
+      "switchyard_rename_project",
       "switchyard_resolve_decision",
+      "switchyard_resolve_remote_revision",
+      "switchyard_return_to_supervisor",
+      "switchyard_rename_task",
       "switchyard_send_message",
+      "switchyard_show_reviewer",
+      "switchyard_show_worker",
+      "switchyard_unregister_project",
+      "switchyard_update_remote",
     ].sort(),
   );
   assert.equal(active.includes("bash"), false);

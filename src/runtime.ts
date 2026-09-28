@@ -5,7 +5,12 @@ import { enqueueMessage, signalWake } from "./inbox.ts";
 import { buildPiLaunch, shellCommand } from "./pi.ts";
 import type { StateStore, WorkerRecord } from "./state.ts";
 import { now } from "./state.ts";
-import { casTransition, taskSourceRoot, terminateActiveReviews } from "./tasks.ts";
+import {
+  casTransition,
+  cleanupTerminalTransientTask,
+  taskSourceRoot,
+  terminateActiveReviews,
+} from "./tasks.ts";
 import { ensureWindow, killWindow, windowAlive } from "./tmux.ts";
 import { changedPaths, diffText, removeWorktree } from "./worktree.ts";
 
@@ -272,10 +277,15 @@ async function launchReservedWorker(
   worker: WorkerRecord,
 ): Promise<void> {
   const workspace = store.getWorkspace(worker.task_id);
+  const task = store.getTask(worker.task_id);
+  if (!task) throw new Error("worker Task is missing");
   if (workspace?.provisioned !== 1) throw new Error("worker workspace is not ready");
   const prompt =
     `You are the SwitchYard Worker for task ${worker.task_id}. ` +
-    "Work only in this task Workspace. The durable Task instruction/context arrives as Pi user input. " +
+    (task.kind === "investigate"
+      ? "Inspect only. This is a read-only investigation: do not modify files or create commits. "
+      : "Work only in this task Workspace. ") +
+    "The durable Task instruction/context arrives as Pi user input. " +
     "Use SwitchYard lifecycle tools for decisions, waiting, and completion.";
   const launch = buildPiLaunch(
     "worker",
@@ -313,7 +323,7 @@ function activateWorkerAndTask(
     casTransition(store, taskId, "starting", "running");
     store.event(taskId, "worker.started", { worker_id: workerId });
     store.event(taskId, "task.started", { worker_id: workerId });
-    enqueueMessage(store, taskId, "supervisor", `Task ${taskId} started`);
+    enqueueMessage(store, taskId, "supervisor", "Work started.");
   });
 }
 
@@ -375,6 +385,7 @@ export async function quiesceTaskRuntimes(
   store: StateStore,
   taskId: string,
   options: { keepReviewId?: string } = {},
+  paths?: SwitchYardPaths,
 ): Promise<void> {
   await stopWorker(store, taskId);
   const task = store.getTask(taskId);
@@ -391,6 +402,9 @@ export async function quiesceTaskRuntimes(
     } else {
       await cleanupFinishedReviewRuntime(store, review.id);
     }
+  }
+  if (task && paths && ["completed", "failed", "cancelled"].includes(task.state)) {
+    await cleanupTerminalTransientTask(store, paths, taskId);
   }
 }
 

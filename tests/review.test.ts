@@ -110,12 +110,15 @@ test("recovery completion requires a clean Review for the current candidate", as
   store.close();
 });
 
-test("steering is rejected during review and cannot be lost on clean completion", async () => {
+test("steering during review is queued and resumes implementation after clean certification", async () => {
   const { store, paths, taskId } = await fixture();
   const reviewId = await beginReview(store, paths, taskId);
+  const candidateSha = store.getTask(taskId)?.candidate_sha;
 
-  assert.throws(() => steerTask(store, taskId, "please change the design"), /under review/);
-  assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
+  steerTask(store, taskId, "please change the design");
+  assert.equal(store.getTask(taskId)?.state, "reviewing");
+  assert.equal(store.getTask(taskId)?.candidate_sha, candidateSha);
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 1);
 
   await submitReview(store, reviewId, {
     verdict: "clean",
@@ -123,8 +126,10 @@ test("steering is rejected during review and cannot be lost on clean completion"
     reviewed_paths: ["a.txt"],
     findings: [],
   });
-  assert.equal(store.getTask(taskId)?.state, "completed");
-  assert.equal(store.listPendingMessages(taskId, "worker").length, 0);
+  assert.equal(store.getReview(reviewId)?.state, "clean");
+  assert.equal(store.getTask(taskId)?.state, "running");
+  assert.equal(store.getTask(taskId)?.candidate_sha, candidateSha);
+  assert.equal(store.listPendingMessages(taskId, "worker").length, 1);
   store.close();
 });
 

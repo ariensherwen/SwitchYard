@@ -142,18 +142,29 @@ export async function submitReview(
       const current = store.getTask(task.id);
       if (!current || current.candidate_sha !== review.candidate_sha)
         throw new Error("candidate changed during review completion");
-      casTransition(store, task.id, "reviewing", "completed");
       store.event(task.id, "review.clean", {
         review_id: reviewId,
         candidate_sha: review.candidate_sha,
       });
-      store.event(task.id, "task.completed", { candidate_sha: review.candidate_sha });
-      enqueueMessage(
-        store,
-        task.id,
-        "supervisor",
-        `Task ${task.id} completed after clean review ${reviewId}`,
-      );
+      if (store.listPendingMessages(task.id, "worker").length > 0) {
+        casTransition(store, task.id, "reviewing", "running");
+        store.event(task.id, "task.resumed", { reason: "steering received during review" });
+        enqueueMessage(
+          store,
+          task.id,
+          "supervisor",
+          "The review passed, and additional guidance is queued. Implementation is resuming.",
+        );
+      } else {
+        casTransition(store, task.id, "reviewing", "completed");
+        store.event(task.id, "task.completed", { candidate_sha: review.candidate_sha });
+        enqueueMessage(
+          store,
+          task.id,
+          "supervisor",
+          "Implementation completed after a clean review.",
+        );
+      }
     } else {
       casTransition(store, task.id, "reviewing", "running");
       store.event(task.id, "review.changes_requested", {
@@ -168,7 +179,7 @@ export async function submitReview(
         store,
         task.id,
         "supervisor",
-        `Review ${reviewId} requested ${submission.findings.length} change(s)`,
+        `The implementation review requested ${submission.findings.length} change(s).`,
       );
     }
   });
@@ -225,7 +236,7 @@ export function recordReviewRuntimeFailure(
       store,
       review.task_id,
       "supervisor",
-      `Review ${reviewId} failed three times and needs a decision`,
+      "Review setup failed three times and needs a decision.",
     );
   });
   return "decision";

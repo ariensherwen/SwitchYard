@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { openSwitchYard } from "./context.ts";
 import { type DoctorReport, runDoctor } from "./doctor.ts";
 import { buildPiLaunch, shellCommand } from "./pi.ts";
-import { addProject } from "./projects.ts";
+import { addProject, resolveUserPath } from "./projects.ts";
 import { reconcile } from "./reconcile.ts";
 import { quiesceTaskRuntimes, startWorker, wakeWorker } from "./runtime.ts";
 import {
@@ -27,23 +27,37 @@ import { canSafelyClean, canSafelyCleanTransient, removeWorktree } from "./workt
 const HELP = `SwitchYard
 
 Usage:
-  switchyard
-  switchyard doctor
-  switchyard project add [path]
-  switchyard project list
-  switchyard task create <project-id> [--kind implement|investigate] [--no-review] <instruction>
-  switchyard task list
-  switchyard task show <task-id>
+  switchyard                         Talk to the Supervisor
+  switchyard doctor                  Check local dependencies
+  switchyard recover                 Reconcile durable state and runtimes
+  switchyard project add [path]      Register an existing Git checkout
+  switchyard project list            List registered Projects
+  switchyard task create <project> [--kind implement|investigate] [--no-review] <instruction>
+  switchyard task list [--json]      List recent work
+  switchyard task show <task-id>     Inspect durable state (debug)
   switchyard task send <task-id> <message>
   switchyard task answer <task-id> <decision-id> <answer>
   switchyard task cancel <task-id>
-  switchyard task attach <task-id>
+  switchyard task attach <task-id>   Capture the Worker pane
   switchyard task clean <task-id>
+
+Machine output:
+  Add --json to project add/list or task create/list to include internal IDs.
 
 Options:
   --help
   --version
 `;
+
+const SUPERVISOR_PROMPT = [
+  "You are SwitchYard's global liaison. Work from registered Project and Task records, never assume the launch directory is a Project. The initial launch directory is only context for explicitly relative paths; ask for an absolute path if the intended checkout is unclear.",
+  "Keep human conversation focused on Project names, Task titles, Decisions, and useful progress. Never show internal UUIDs, commit hashes, raw lifecycle state names, or database plumbing; translate progress into plain language.",
+  "Use SwitchYard control tools only. Delegate implementation to Workers; do not edit repositories or task Workspaces yourself. Implementation Tasks use the review loop by default; investigation Tasks are read-only and never reviewed.",
+  "Before starting work in a dirty Project checkout, ask whether to leave local changes untouched and use committed HEAD. Capture the chosen base ref and never move an existing Task to a different revision.",
+  "Unknown local checkouts require registration details. Unknown remotes require an explicit choice: clone and register for implementation, or inspect a concrete pinned commit as a transient investigation without registration. Resolve remote refs to a full commit SHA before investigation and preserve the selected ref as context.",
+  "Completion is not landing or publishing. Do not change the Project branch, push, open a PR, or merge unless the human explicitly asks. Landing fast-forwards the current Project branch only and refuses dirty or advanced targets; never resolve divergence automatically. Publishing pushes only the exact candidate to human-named Git remote(s) and branch; ask for any missing target and do not invent one. SwitchYard has no forge tool: publishing does not open or merge a PR.",
+  "If a completed Task cannot be landed because its Project advanced, explain the conflict and offer a separate integration Task based on the current Project state. Do not create that follow-up without the human's agreement.",
+].join("\n\n");
 
 async function main(args: string[]): Promise<number> {
   if (args.includes("--help")) {
@@ -64,6 +78,11 @@ async function main(args: string[]): Promise<number> {
   try {
     const { paths, store } = await openSwitchYard();
     try {
+      if (args[0] === "recover") {
+        await reconcile(store, paths);
+        console.log("Recovery complete.");
+        return 0;
+      }
       if (args[0] === "project") return await handleProject(store, paths, args.slice(1));
       if (args[0] === "task") return await handleTask(store, paths, args.slice(1));
       console.error(`Unknown command: ${args[0]}`);
@@ -87,8 +106,9 @@ async function launchSupervisor(): Promise<number> {
       {
         SWITCHYARD_HOME: paths.home,
         SWITCHYARD_SUPERVISOR: "1",
+        SWITCHYARD_LAUNCH_CWD: process.cwd(),
       },
-      "You are the SwitchYard Supervisor. Delegate implementation to SwitchYard workers; do not edit worker workspaces directly.",
+      SUPERVISOR_PROMPT,
     );
     await ensureWindow("supervisor", launch.cwd, shellCommand(launch));
     return await attachWindow("supervisor");
@@ -103,12 +123,19 @@ async function handleProject(
   args: string[],
 ): Promise<number> {
   if (args[0] === "add") {
-    const project = await addProject(store, paths, args[1] ?? process.cwd());
-    console.log(`${project.id}\t${project.root_path}`);
+    const location = args.slice(1).find((value) => value !== "--json") ?? process.cwd();
+    const project = await addProject(store, paths, location);
+    console.log(
+      args.includes("--json")
+        ? JSON.stringify(project)
+        : `Registered ${project.name} at ${project.root_path}`,
+    );
     return 0;
   }
   if (args[0] === "list") {
-    for (const project of store.listProjects()) console.log(`${project.id}\t${project.root_path}`);
+    const projects = store.listProjects();
+    if (args.includes("--json")) console.log(JSON.stringify(projects, null, 2));
+    else for (const project of projects) console.log(`${project.name}\t${project.root_path}`);
     return 0;
   }
   throw new Error("usage: switchyard project add [path] | switchyard project list");
@@ -129,19 +156,20 @@ async function handleTask(
         kind: { type: "string", default: "implement" },
         review: { type: "boolean" },
         "no-review": { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
       },
     });
-    const [projectId, ...instructionParts] = parsed.positionals;
-    if (!projectId || instructionParts.length === 0)
-      throw new Error("task create requires <project-id> and <instruction>");
+    const [projectReference, ...instructionParts] = parsed.positionals;
+    if (!projectReference || instructionParts.length === 0)
+      throw new Error("task create requires <project> and <instruction>");
+    const project = resolveProjectArgument(store, projectReference);
     if (parsed.values.kind !== "implement" && parsed.values.kind !== "investigate")
       throw new Error("--kind must be implement or investigate");
     if (parsed.values.kind === "investigate" && args.slice(1).includes("--review"))
       throw new Error("--review is supported only for implement tasks");
-    if (!store.getProject(projectId)) throw new Error(`project not found: ${projectId}`);
     const task = createTask(
       store,
-      projectId,
+      project.id,
       parsed.values.kind,
       instructionParts.join(" "),
       reviewPolicyForTask(parsed.values.kind, parsed.values["no-review"] ? false : undefined),
@@ -161,12 +189,26 @@ async function handleTask(
         );
       }
     }
-    console.log(task.id);
-    return store.getTask(task.id)?.state === "failed" ? 1 : 0;
+    const finalTask = store.getTask(task.id) ?? task;
+    if (parsed.values.json) {
+      console.log(JSON.stringify({ task: finalTask, project: project.name }, null, 2));
+    } else {
+      console.log(`${project.name} / ${finalTask.title}: ${finalTask.state}`);
+    }
+    return finalTask.state === "failed" ? 1 : 0;
   }
   if (command === "list") {
-    for (const task of store.listTasks())
-      console.log(`${task.id}\t${task.state}\t${task.kind}\t${task.project_id ?? task.source_url}`);
+    const tasks = store.listTasks();
+    if (args.includes("--json")) {
+      console.log(JSON.stringify(tasks, null, 2));
+    } else {
+      for (const task of tasks) {
+        const project = task.project_id ? store.getProject(task.project_id) : undefined;
+        console.log(
+          `${project?.name ?? task.source_label ?? "Transient source"}\t${task.title}\t${task.state}\t${task.kind}`,
+        );
+      }
+    }
     return 0;
   }
   const taskId = args[1];
@@ -189,8 +231,8 @@ async function handleTask(
   if (command === "send") {
     const message = args.slice(2).join(" ").trim();
     if (!message) throw new Error("task send requires <message>");
-    steerTask(store, taskId, message);
-    await wakeWorker(store, paths, taskId);
+    const current = steerTask(store, taskId, message);
+    if (current.state !== "reviewing") await wakeWorker(store, paths, taskId);
     return 0;
   }
   if (command === "answer") {
@@ -203,7 +245,7 @@ async function handleTask(
   }
   if (command === "cancel") {
     cancelTask(store, taskId);
-    await quiesceTaskRuntimes(store, taskId);
+    await quiesceTaskRuntimes(store, taskId, {}, paths);
     return 0;
   }
   if (command === "attach") {
@@ -244,6 +286,30 @@ async function handleTask(
     return 0;
   }
   throw new Error(`unknown task command: ${command}`);
+}
+
+function resolveProjectArgument(
+  store: Awaited<ReturnType<typeof openSwitchYard>>["store"],
+  reference: string,
+) {
+  const direct = store.getProject(reference);
+  if (direct?.registration_state === "registered") return direct;
+  const projects = store.listProjects();
+  const named = projects.filter(
+    (project) => project.name.toLocaleLowerCase() === reference.trim().toLocaleLowerCase(),
+  );
+  if (named.length === 1) {
+    const project = named[0];
+    if (project) return project;
+  }
+  if (named.length > 1)
+    throw new Error(
+      `Project name is ambiguous; use its local path: ${named.map((project) => project.root_path).join(", ")}`,
+    );
+  const target = resolveUserPath(reference);
+  const matchingPath = projects.find((project) => project.root_path === target);
+  if (matchingPath) return matchingPath;
+  throw new Error(`registered Project not found: ${reference}`);
 }
 
 async function readPackageVersion(): Promise<string> {

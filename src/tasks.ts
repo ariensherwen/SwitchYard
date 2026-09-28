@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import path from "node:path";
 import type { SwitchYardPaths } from "./home.ts";
 import { enqueueMessage } from "./inbox.ts";
+import { validateProjectCheckout } from "./projects.ts";
 import type { ReviewPolicy, StateStore, TaskKind, TaskRecord, TaskState } from "./state.ts";
 import { now } from "./state.ts";
 import {
+  canSafelyCleanTransient,
+  canSafelyCleanTransientSource,
+  currentBranch,
   ensureTaskWorkspace,
   ensureTransientRepository,
+  removeWorktree,
   taskWorkspaceBase,
   validateImplementCandidate,
   validateInvestigateCompletion,
@@ -39,6 +46,7 @@ export function createTask(
   instruction: string,
   reviewPolicy: ReviewPolicy,
   title = instruction,
+  options: { baseRef?: string; dirtyAcknowledged?: boolean } = {},
 ): TaskRecord {
   if (reviewPolicy === "loop" && kind !== "implement")
     throw new Error("review loop is supported only for implement tasks");
@@ -48,9 +56,21 @@ export function createTask(
   store.transaction(() => {
     store.db
       .prepare(`INSERT INTO tasks(
-        id, project_id, title, kind, instruction, review_policy, state, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
-      .run(id, projectId, title, kind, instruction, reviewPolicy, timestamp, timestamp);
+        id, project_id, title, kind, instruction, review_policy, base_ref, dirty_acknowledged,
+        state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+      .run(
+        id,
+        projectId,
+        title.trim(),
+        kind,
+        instruction,
+        reviewPolicy,
+        options.baseRef?.trim() || null,
+        options.dirtyAcknowledged ? 1 : 0,
+        timestamp,
+        timestamp,
+      );
     store.event(id, "task.created", { kind, review: reviewPolicy });
   });
   return requiredTask(store, id);
@@ -62,8 +82,14 @@ export function createTransientInvestigation(
   sourceUrl: string,
   instruction: string,
   title = instruction,
+  sourceLabel = sourceUrl,
+  sourceRevision?: string,
+  sourceRef?: string,
 ): TaskRecord {
   if (!sourceUrl.trim()) throw new Error("transient source URL is required");
+  if (!sourceRevision) throw new Error("transient source requires a resolved commit SHA");
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sourceRevision))
+    throw new Error("transient source revision must be a full Git commit SHA");
   if (!title.trim()) throw new Error("task title is required");
   const id = randomUUID();
   const timestamp = now();
@@ -71,11 +97,30 @@ export function createTransientInvestigation(
   store.transaction(() => {
     store.db
       .prepare(`INSERT INTO tasks(
-        id, project_id, source_path, source_url, title, kind, instruction, review_policy, state,
-        created_at, updated_at
-      ) VALUES (?, NULL, ?, ?, ?, 'investigate', ?, 'off', 'queued', ?, ?)`)
-      .run(id, sourcePath, sourceUrl, title, instruction, timestamp, timestamp);
-    store.event(id, "task.created", { kind: "investigate", review: "off", transient_source: true });
+        id, project_id, source_path, source_url, source_label, source_revision, source_ref, title,
+        kind, instruction, review_policy, state, created_at, updated_at
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'investigate', ?, 'off', 'queued', ?, ?)`)
+      .run(
+        id,
+        sourcePath,
+        sourceUrl,
+        sourceLabel.trim() && sourceLabel.trim() !== sourceUrl.trim()
+          ? sourceLabel.trim()
+          : humanSourceLabel(sourceUrl),
+        sourceRevision?.toLowerCase() ?? null,
+        sourceRef ?? null,
+        title.trim(),
+        instruction,
+        timestamp,
+        timestamp,
+      );
+    store.event(id, "task.created", {
+      kind: "investigate",
+      review: "off",
+      transient_source: true,
+      source_revision: sourceRevision?.toLowerCase() ?? null,
+      source_ref: sourceRef ?? null,
+    });
   });
   return requiredTask(store, id);
 }
@@ -101,6 +146,72 @@ export function taskSourceRoot(store: StateStore, task: TaskRecord): string {
   }
   if (task.source_path) return task.source_path;
   throw new Error(`task ${task.id} has no source checkout`);
+}
+
+export async function cleanupTerminalTransientTask(
+  store: StateStore,
+  paths: SwitchYardPaths,
+  taskId: string,
+): Promise<"cleaned" | "preserved" | "cleanup_failed"> {
+  const task = requiredTask(store, taskId);
+  if (!TERMINAL.has(task.state)) return "preserved";
+  if (task.project_id || !task.source_path || !task.source_revision) return "preserved";
+  if (store.getLiveWorker(taskId) || store.getLatestReview(taskId)?.state === "running")
+    return "preserved";
+  const expectedSourcePath = path.resolve(paths.sources, task.id);
+  if (path.resolve(task.source_path) !== expectedSourcePath) {
+    recordTransientCleanupFailure(
+      store,
+      taskId,
+      "transient source path is outside the SwitchYard home",
+    );
+    return "cleanup_failed";
+  }
+  if (!existsSync(task.source_path)) return "preserved";
+  const workspace = store.getWorkspace(taskId);
+  try {
+    if (workspace && existsSync(workspace.path)) {
+      const baseSha = task.base_sha ?? task.source_revision;
+      if (!(await canSafelyCleanTransient(task.source_path, workspace.path, baseSha)))
+        return "preserved";
+      await removeWorktree(task.source_path, workspace.path);
+      markWorkspaceCleaned(store, taskId);
+    } else {
+      if (!(await canSafelyCleanTransientSource(task.source_path, task.source_revision)))
+        return "preserved";
+      if (workspace?.provisioned) markWorkspaceCleaned(store, taskId);
+    }
+    await rm(task.source_path, { recursive: true });
+    store.transaction(() =>
+      store.event(taskId, "transient_source.cleaned", { path: task.source_path }),
+    );
+    return "cleaned";
+  } catch (error) {
+    recordTransientCleanupFailure(
+      store,
+      taskId,
+      error instanceof Error ? error.message : String(error),
+    );
+    return "cleanup_failed";
+  }
+}
+
+function humanSourceLabel(sourceUrl: string): string {
+  try {
+    const remote = new URL(sourceUrl);
+    const repository = remote.pathname.replace(/\.git$/, "").replace(/\/$/, "");
+    return `${remote.hostname}${repository}`;
+  } catch {
+    const ssh = sourceUrl.match(/^(?:[^@]+@)?([^:]+):(.+)$/);
+    const host = ssh?.[1];
+    const repository = ssh?.[2];
+    if (host && repository) return `${host}${repository.replace(/\.git$/, "")}`;
+    return path.basename(sourceUrl);
+  }
+}
+
+function recordTransientCleanupFailure(store: StateStore, taskId: string, reason: string): void {
+  store.transaction(() => store.event(taskId, "transient_source.cleanup_failed", { reason }));
 }
 
 export function markWorkspaceCleaned(store: StateStore, taskId: string): void {
@@ -133,19 +244,38 @@ export async function startTask(
   if (task.project_id && !project) throw new Error(`project not found: ${task.project_id}`);
   let sourceRoot: string;
   if (project) {
-    sourceRoot = project.root_path;
+    sourceRoot = await validateProjectCheckout(store, project);
   } else if (
     task.kind === "investigate" &&
     task.review_policy === "off" &&
     task.source_path &&
-    task.source_url
+    task.source_url &&
+    task.source_revision
   ) {
     const expectedSourcePath = path.resolve(paths.sources, task.id);
     if (path.resolve(task.source_path) !== expectedSourcePath)
       throw new Error("transient source path is outside the SwitchYard home");
-    sourceRoot = await ensureTransientRepository(task.source_url, task.source_path);
+    sourceRoot = await ensureTransientRepository(
+      task.source_url,
+      task.source_path,
+      task.source_revision ?? undefined,
+      task.source_ref ?? undefined,
+    );
   } else {
     throw new Error("task requires a registered Project or a transient investigation source");
+  }
+  if (project && task.state === "queued" && !task.base_ref) {
+    const branch = await currentBranch(sourceRoot);
+    if (branch) {
+      store.transaction(() => {
+        const changed = store.db
+          .prepare("UPDATE tasks SET base_ref=? WHERE id=? AND state='queued' AND base_ref IS NULL")
+          .run(branch, taskId);
+        if (changed.changes === 1)
+          store.event(taskId, "task.base_ref_captured", { base_ref: branch });
+      });
+      task = requiredTask(store, taskId);
+    }
   }
   const workspacePath = path.join(paths.worktrees, project?.id ?? "transient", taskId);
   const branch = `switchyard/task-${taskId}`;
@@ -158,7 +288,13 @@ export async function startTask(
   }
 
   if (task.state === "queued") {
-    const baseSha = await taskWorkspaceBase(sourceRoot, workspacePath, branch);
+    const baseSha = await taskWorkspaceBase(
+      sourceRoot,
+      workspacePath,
+      branch,
+      task.base_ref ?? undefined,
+      task.dirty_acknowledged === 1,
+    );
     store.transaction(() => {
       const current = requiredTask(store, taskId);
       if (current.state === "queued") {
@@ -203,7 +339,15 @@ export async function startTask(
     workspace = store.getWorkspace(taskId);
     if (task.state === "running" && workspace?.provisioned === 1) return task;
   } else if (task.state === "starting" && !workspace) {
-    const baseSha = task.base_sha ?? (await taskWorkspaceBase(sourceRoot, workspacePath, branch));
+    const baseSha =
+      task.base_sha ??
+      (await taskWorkspaceBase(
+        sourceRoot,
+        workspacePath,
+        branch,
+        task.base_ref ?? undefined,
+        task.dirty_acknowledged === 1,
+      ));
     store.transaction(() => {
       const current = requiredTask(store, taskId);
       if (current.state === "starting" && !store.getWorkspace(taskId)) {
@@ -317,7 +461,7 @@ export function markWaiting(store: StateStore, taskId: string, reason: string): 
   store.transaction(() => {
     casTransition(store, taskId, "running", "waiting");
     store.event(taskId, "task.waiting", { reason });
-    enqueueMessage(store, taskId, "supervisor", `Task ${taskId} is waiting: ${reason}`);
+    enqueueMessage(store, taskId, "supervisor", `The Task is waiting for input: ${reason}`);
   });
   return requiredTask(store, taskId);
 }
@@ -335,7 +479,6 @@ export function resumeWaiting(store: StateStore, taskId: string, message: string
 export function steerTask(store: StateStore, taskId: string, message: string): TaskRecord {
   const task = requiredTask(store, taskId);
   if (TERMINAL.has(task.state)) throw new Error("cannot steer a terminal task");
-  if (task.state === "reviewing") throw new Error("cannot steer a task while it is under review");
   if (task.state === "waiting") return resumeWaiting(store, taskId, message);
   enqueueMessage(store, taskId, "worker", message);
   return requiredTask(store, taskId);
@@ -405,7 +548,7 @@ export async function submitCandidate(
         .prepare("UPDATE tasks SET summary=?, verification_summary=?, updated_at=? WHERE id=?")
         .run(summary, verificationSummary, now(), taskId);
       store.event(taskId, "task.completed", { summary });
-      enqueueMessage(store, taskId, "supervisor", `Task ${taskId} completed: ${summary}`);
+      enqueueMessage(store, taskId, "supervisor", `Work completed: ${summary}`);
     });
     return { task: requiredTask(store, taskId), candidateSha: null };
   }
@@ -435,12 +578,12 @@ export async function submitCandidate(
         store,
         taskId,
         "supervisor",
-        `Task ${taskId} entered review for ${candidateSha}`,
+        "The implementation candidate is ready for review.",
       );
     } else {
       casTransition(store, taskId, "running", "completed");
       store.event(taskId, "task.completed", { candidate_sha: candidateSha, summary });
-      enqueueMessage(store, taskId, "supervisor", `Task ${taskId} completed: ${summary}`);
+      enqueueMessage(store, taskId, "supervisor", `Work completed: ${summary}`);
     }
   });
   return { task: requiredTask(store, taskId), candidateSha };
@@ -453,7 +596,7 @@ export function cancelTask(store: StateStore, taskId: string): TaskRecord {
   store.transaction(() => {
     casTransition(store, taskId, task.state, "cancelled");
     store.event(taskId, "task.cancelled");
-    enqueueMessage(store, taskId, "supervisor", `Task ${taskId} cancelled`);
+    enqueueMessage(store, taskId, "supervisor", "The Task was cancelled.");
   });
   return requiredTask(store, taskId);
 }
@@ -467,7 +610,7 @@ export function failTask(store: StateStore, taskId: string, failure: string): Ta
       .prepare("UPDATE tasks SET failure=?, updated_at=? WHERE id=?")
       .run(failure, now(), taskId);
     store.event(taskId, "task.failed", { failure });
-    enqueueMessage(store, taskId, "supervisor", `Task ${taskId} failed: ${failure}`);
+    enqueueMessage(store, taskId, "supervisor", `Work stopped: ${failure}`);
   });
   return requiredTask(store, taskId);
 }

@@ -1,10 +1,10 @@
 # SwitchYard
 
-SwitchYard is a local control plane for supervising Pi coding workers in tmux with durable SQLite state and task-owned Git worktrees.
+SwitchYard lets a global Pi Supervisor coordinate coding Tasks in registered local Git Projects. Workers run in task-owned Git worktrees; SQLite holds durable state, Messages, Decisions, and Events. tmux hosts the Pi sessions but is not a source of Task state.
 
 ## Requirements
 
-- Node >= 22.19
+- Node.js >= 22.19
 - Git
 - tmux
 - Pi >= 0.87.1
@@ -19,85 +19,57 @@ npm link
 switchyard doctor
 ```
 
-## Launch
+## Talk to the Supervisor
 
-```sh
-switchyard
+Run `switchyard` from any directory. It opens the same home-scoped Supervisor; the launch directory is not treated as a Project.
+
+```text
+$ switchyard
+You: Register ~/work/kinetix as Kinetix, then fix issue #142.
+Supervisor: I found uncommitted changes in Kinetix. Should I leave them untouched and start from committed HEAD?
+You: Yes.
+Supervisor: I started “Fix Kinetix issue #142”. It will go through implementation review before I report completion.
 ```
 
-SwitchYard initializes `${SWITCHYARD_HOME:-~/.switchyard}`, reconciles durable state, ensures a tmux session namespaced to that home, starts the Supervisor Pi from `$SWITCHYARD_HOME/supervisor`, and attaches to it. Running the command from inside tmux switches the current client instead of nesting sessions.
+The Supervisor can register, create, rename, inspect, relocate, and unregister Projects; manage Git remotes; start and steer Tasks; resolve Decisions; and show live Worker or Reviewer panes. Worker and Reviewer panes are observational: send steering and answer Decisions through the Supervisor. It uses Project names and Task titles rather than internal IDs. If a name is ambiguous, it asks you to choose.
 
-Set a different state root with:
+Implementation Tasks run the review loop by default. Investigation Tasks use a pinned, temporary checkout and cannot submit source changes. Remote implementation requires consent to clone and register a Project. Inspecting a remote without registering it requires a concrete commit SHA.
 
-```sh
-SWITCHYARD_HOME=/custom/path switchyard
-```
+## Explicit integration
 
-## Projects and tasks
+A completed Task stays in its Workspace until you ask to land or publish it.
 
-Register a Git checkout:
+- “Land the Kinetix fix” fast-forwards the current Project branch only if its checkout is clean and still at the Task's captured base. If the Project advanced, SwitchYard refuses; it does not merge or rebase for you.
+- “Push the candidate to origin as `fix/issue-142`” publishes the exact reviewed candidate to that branch. Publishing does not open or merge a PR.
+
+## CLI and state
+
+The CLI remains available for setup, diagnostics, recovery, and scripts:
 
 ```sh
 switchyard project add /path/to/repo
 switchyard project list
-```
-
-The Supervisor uses Project names and Task titles or natural descriptions. Its task list and detail tools omit internal UUIDs; steering, cancellation, and Decision answers take a natural Task reference. An unknown remote URL opens intake: implementation requires explicit approval, a Project name, and a clone destination. Review-only starts an investigation Task from a temporary checkout without registering a Project.
-
-Create and immediately dispatch work from the CLI:
-
-```sh
-switchyard task create <project-id> "Implement the requested change"
-switchyard task create <project-id> --kind investigate "Investigate the failure"
-switchyard task create <project-id> --no-review "Implement without the review loop"
-```
-
-Each Task owns one worktree under `$SWITCHYARD_HOME/worktrees/<project-id>/<task-id>` on branch `switchyard/task-<task-id>`. Transient investigations use `$SWITCHYARD_HOME/worktrees/transient/<task-id>` and a task-owned source clone under `$SWITCHYARD_HOME/sources/<task-id>`. Registered Project checkouts must be clean when a Task starts.
-
-Inspect and steer tasks:
-
-```sh
 switchyard task list
-switchyard task show <task-id>
-switchyard task send <task-id> "Additional instruction"
-switchyard task answer <task-id> <decision-id> "Human answer"
-switchyard task attach <task-id>
-switchyard task cancel <task-id>
-switchyard task clean <task-id>
+switchyard doctor
+switchyard recover
 ```
 
-Messages and Decision answers are stored before delivery. `task attach` prints a read-only Worker pane snapshot; use `task send` to steer it. Cancellation stops active runtimes but preserves the task Workspace. Terminalizing a Task cancels any open Decision. `task clean` refuses deletion when a registered Project workspace contains unlanded commits, or when a transient source or workspace contains uncommitted work; successful cleanup clears the Workspace's provisioned state.
+Use `switchyard --help` for the full command surface. Normal output uses Project names and Task titles. Add `--json` to supported commands when a script needs internal IDs.
 
-## Completion and review
-
-Workers complete through structured SwitchYard tools rather than terminal prose. Implement Tasks must submit a clean committed candidate on the expected branch that descends from the captured base revision.
-
-Review is enabled by default for `implement` Tasks; `--no-review` opts out. `investigate` Tasks are never reviewed. Every review runs in a fresh Pi session and detached review worktree at one exact candidate SHA. A clean result is accepted only when it covers the complete changed-path set, contains no findings, the review checkout is clean, and the Worker Workspace still points at the reviewed candidate. Findings return the Task to its Worker for another revision.
-
-## Durable state and recovery
-
-SQLite state lives at `$SWITCHYARD_HOME/switchyard.db` with foreign keys, WAL, and a busy timeout enabled. SwitchYard persists Projects, Tasks and their titles/sources, Workspaces, Worker history, Messages, Decisions, Reviews, Findings, and Events.
-
-Startup reconciliation resumes queued Tasks, completes Workspace reservations interrupted before or after `git worktree add`, preserves waiting Decisions, does not resurrect terminal Tasks, replaces missing Workers in the same task-owned Workspace, and restarts interrupted Reviews for the same candidate. Resuming a waiting Task or answering a Decision ensures a live Worker before returning. A missing provisioned Workspace still fails its nonterminal Task rather than silently recreating it. Terminalizing a Task cancels any open Decision and aborts a running Review durably; reconciliation cleans up runtimes and review worktrees.
+SwitchYard stores state under `${SWITCHYARD_HOME:-~/.switchyard}`. Set `SWITCHYARD_HOME` to use a separate home. Terminal Task Workspaces remain available until safely cleaned or landed. A transient source is removed after terminal completion only when its pinned checkout and Workspace are unchanged; uncertain or dirty work is preserved.
 
 ## Development
 
-Deterministic merge gate:
+Run the deterministic merge gate locally:
 
 ```sh
 ./scripts/run-ci.sh
 ```
 
-All CI is run locally through `./scripts/run-ci.sh`; SwitchYard does not use GitHub Actions as a merge gate.
-
-Opt-in live Pi/tmux acceptance:
+Real Pi/tmux acceptance is opt-in:
 
 ```sh
 SWITCHYARD_LIVE=1 ./scripts/run-live-e2e.sh
 ```
 
-The deterministic suite covers domain, SQLite, real Git, review, role separation, CLI, and tmux integration when tmux is installed. The live suite also invokes the actual Supervisor extension with natural Project/Task references, then uses a disposable repository, disposable `SWITCHYARD_HOME`, and a unique tmux session.
-
-## 0.1.0 limits
-
-0.1.0 is deliberately Pi + tmux + local Git worktrees. It does not provide remote workers, alternate agent/runtime backends, model routing, per-task model selection, multiple reviewers, a scheduler, a dashboard, PR automation, or multi-user execution.
+SwitchYard currently targets local Pi sessions, tmux, Git worktrees, and SQLite. It does not provide remote Workers, alternate runtimes, scheduling, multi-user execution, or PR automation.

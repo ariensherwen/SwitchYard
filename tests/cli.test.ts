@@ -47,7 +47,7 @@ async function waitForFile(filePath: string, timeoutMs = 5000) {
   assert.fail(`timed out waiting for ${filePath}`);
 }
 
-test("help exposes the 0.1.0 task surface", async () => {
+test("help leads with the Supervisor and keeps task commands available", async () => {
   const result = await run(["--help"]);
   assert.equal(result.code, 0);
   assert.match(result.stdout, /project add/);
@@ -55,10 +55,18 @@ test("help exposes the 0.1.0 task surface", async () => {
   assert.match(result.stdout, /task clean/);
 });
 
-test("version remains package 0.1.0", async () => {
+test("recover reconciles a fresh state home", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "switchyard-cli-recover-"));
+  dirs.push(home);
+  const result = await run(["recover"], { ...process.env, SWITCHYARD_HOME: home });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "Recovery complete.");
+});
+
+test("version reports package 0.1.1", async () => {
   const result = await run(["--version"]);
   assert.equal(result.code, 0);
-  assert.equal(result.stdout.trim(), "0.1.0");
+  assert.equal(result.stdout.trim(), "0.1.1");
 });
 
 test("project add/list persists under SWITCHYARD_HOME", async () => {
@@ -67,14 +75,19 @@ test("project add/list persists under SWITCHYARD_HOME", async () => {
   dirs.push(repo, home);
   await exec("git", ["init", "-b", "main"], { cwd: repo });
   const env = { ...process.env, SWITCHYARD_HOME: home };
-  const added = await run(["project", "add", repo], env);
+  const added = await run(["project", "add", repo, "--json"], env);
   assert.equal(added.code, 0);
-  const id = added.stdout.split("\t")[0]?.trim();
-  assert.ok(id);
+  const project = JSON.parse(added.stdout) as { id: string };
+  assert.ok(project.id);
   const listed = await run(["project", "list"], env);
   assert.equal(listed.code, 0);
-  assert.match(listed.stdout, new RegExp(id));
-  assert.match(listed.stdout, new RegExp(repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(listed.stdout, /switchyard-cli-repo-/);
+  assert.doesNotMatch(
+    listed.stdout,
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+  );
+  const machineList = await run(["project", "list", "--json"], env);
+  assert.match(machineList.stdout, new RegExp(project.id));
 });
 
 test("CLI reviews implement Tasks by default and supports explicit opt-out", async () => {
@@ -108,19 +121,20 @@ test("CLI reviews implement Tasks by default and supports explicit opt-out", asy
   const env = { ...process.env, SWITCHYARD_HOME: home, PATH: `${bin}:${process.env.PATH}` };
   delete env.TMUX;
 
-  const defaultTask = await run(["task", "create", "p", "Implement with review"], env);
+  const defaultTask = await run(["task", "create", "p", "--json", "Implement with review"], env);
   assert.equal(defaultTask.code, 0, defaultTask.stderr);
-  const attached = await run(["task", "attach", defaultTask.stdout.trim()], env);
+  const defaultTaskId = (JSON.parse(defaultTask.stdout) as { task: { id: string } }).task.id;
+  const attached = await run(["task", "attach", defaultTaskId], env);
   assert.equal(attached.code, 0, attached.stderr);
   assert.match(attached.stdout, /read-only Worker pane/);
   assert.doesNotMatch(await readFile(tmuxCommands, "utf8"), /attach-session|switch-client/);
   const optOutTask = await run(
-    ["task", "create", "p", "--no-review", "Implement without review"],
+    ["task", "create", "p", "--json", "--no-review", "Implement without review"],
     env,
   );
   assert.equal(optOutTask.code, 0, optOutTask.stderr);
   const investigateTask = await run(
-    ["task", "create", "p", "--kind", "investigate", "Inspect without review"],
+    ["task", "create", "p", "--json", "--kind", "investigate", "Inspect without review"],
     env,
   );
   assert.equal(investigateTask.code, 0, investigateTask.stderr);
@@ -133,15 +147,15 @@ test("CLI reviews implement Tasks by default and supports explicit opt-out", asy
 
   const verified = new StateStore(paths.database);
   assert.equal(
-    verified.listTasks().find((task) => task.id === defaultTask.stdout.trim())?.review_policy,
+    verified.listTasks().find((task) => task.id === defaultTaskId)?.review_policy,
     "loop",
   );
   assert.equal(
-    verified.listTasks().find((task) => task.id === optOutTask.stdout.trim())?.review_policy,
+    verified.listTasks().find((task) => task.title === "Implement without review")?.review_policy,
     "off",
   );
   assert.equal(
-    verified.listTasks().find((task) => task.id === investigateTask.stdout.trim())?.review_policy,
+    verified.listTasks().find((task) => task.title === "Inspect without review")?.review_policy,
     "off",
   );
   assert.equal(verified.listTasks().length, 3);
@@ -185,7 +199,7 @@ test("CLI Task startup and reconciliation share the durable Workspace claim", as
   await chmod(path.join(bin, "tmux"), 0o755);
   const env = { ...process.env, SWITCHYARD_HOME: home, PATH: `${bin}:${process.env.PATH}` };
   delete env.TMUX;
-  const cliStartup = run(["task", "create", "p", "Concurrent startup"], env);
+  const cliStartup = run(["task", "create", "p", "--json", "Concurrent startup"], env);
   const reconcilerStore = new StateStore(paths.database);
 
   try {
@@ -206,7 +220,7 @@ test("CLI Task startup and reconciliation share the durable Workspace claim", as
 
   const result = await cliStartup;
   assert.equal(result.code, 0, result.stderr);
-  const taskId = result.stdout.trim();
+  const taskId = (JSON.parse(result.stdout) as { task: { id: string } }).task.id;
   assert.ok(taskId);
   assert.equal(reconcilerStore.getTask(taskId)?.state, "running");
   assert.equal(reconcilerStore.getWorkspace(taskId)?.provisioned, 1);

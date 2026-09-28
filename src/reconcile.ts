@@ -29,7 +29,7 @@ export async function reconcile(store: StateStore, paths: SwitchYardPaths): Prom
         store.event(task.id, "task.recovery_failed", { failure });
       });
       try {
-        await quiesceTaskRuntimes(store, task.id);
+        await quiesceTaskRuntimes(store, task.id, {}, paths);
       } catch (cleanupError) {
         store.transaction(() => {
           store.event(task.id, "task.recovery_cleanup_failed", {
@@ -53,7 +53,7 @@ async function reconcileTask(
     store.transaction(() =>
       terminateActiveReviews(store, task.id, task.state as "completed" | "failed" | "cancelled"),
     );
-    await quiesceTaskRuntimes(store, task.id);
+    await quiesceTaskRuntimes(store, task.id, {}, paths);
     return;
   }
 
@@ -73,7 +73,7 @@ async function reconcileTask(
   const workspace = store.getWorkspace(task.id);
   if (workspace?.provisioned !== 1 || !existsSync(workspace.path)) {
     failTask(store, task.id, "task workspace is missing or not provisioned during recovery");
-    await quiesceTaskRuntimes(store, task.id);
+    await quiesceTaskRuntimes(store, task.id, {}, paths);
     return;
   }
 
@@ -104,7 +104,7 @@ async function reconcileTask(
   if (latest?.state === "clean" && latest.candidate_sha === task.candidate_sha) {
     const completed = completeRecoveredReview(store, task.id, latest.candidate_sha, latest.id);
     if (completed) {
-      await quiesceTaskRuntimes(store, task.id);
+      await quiesceTaskRuntimes(store, task.id, {}, paths);
       await cleanupFinishedReviewRuntime(store, latest.id);
     }
   } else if (latest?.state !== "running" || latest.startup_reserved) {

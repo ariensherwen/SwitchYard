@@ -78,8 +78,18 @@ async function fixture() {
 
 test("transient investigation uses a cloned source without registering a Project", async () => {
   const { paths, store } = await fixture();
-  const sourceUrl = pathToFileURL(path.join(path.dirname(paths.home), "repo")).href;
-  const task = createTransientInvestigation(store, paths, sourceUrl, "Inspect the remote source");
+  const sourcePath = path.join(path.dirname(paths.home), "repo");
+  const sourceUrl = pathToFileURL(sourcePath).href;
+  const { stdout: revision } = await exec("git", ["rev-parse", "HEAD"], { cwd: sourcePath });
+  const task = createTransientInvestigation(
+    store,
+    paths,
+    sourceUrl,
+    "Inspect the remote source",
+    undefined,
+    sourceUrl,
+    revision.trim(),
+  );
 
   await startTask(store, paths, task.id);
 

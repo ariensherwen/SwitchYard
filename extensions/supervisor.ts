@@ -1,10 +1,33 @@
 import path from "node:path";
 import { openSwitchYard } from "../src/context.ts";
 import { markDelivered, startWakePump } from "../src/inbox.ts";
-import { addProject, cloneProject, isRemoteGitUrl } from "../src/projects.ts";
+import { landCompletedTask } from "../src/landing.ts";
+import {
+  addProject,
+  addProjectRemote,
+  cloneProject,
+  createProject,
+  inspectProject,
+  isRemoteGitUrl,
+  listProjectRemotes,
+  relocateProject,
+  removeProjectRemote,
+  renameProject,
+  resolveUserPath,
+  unregisterProject,
+  updateProjectRemote,
+  validateProjectCheckout,
+} from "../src/projects.ts";
+import { publishCompletedTask } from "../src/publish.ts";
 import { reconcile } from "../src/reconcile.ts";
 import { quiesceTaskRuntimes, startWorker, wakeWorker } from "../src/runtime.ts";
-import type { MessageRecord, ProjectRecord, TaskKind, TaskRecord } from "../src/state.ts";
+import type {
+  MessageRecord,
+  ProjectRecord,
+  ReviewRecord,
+  TaskKind,
+  TaskRecord,
+} from "../src/state.ts";
 import {
   cancelTask,
   createTask,
@@ -14,15 +37,30 @@ import {
   reviewPolicyForTask,
   startTask,
   steerTask,
+  updateTaskTitle,
 } from "../src/tasks.ts";
+import { attachWindow } from "../src/tmux.ts";
+import { projectHasChanges, resolveRemoteRevision } from "../src/worktree.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
-import { booleanSchema, enumSchema, objectSchema, stringSchema } from "./schema.ts";
+import {
+  booleanSchema,
+  enumSchema,
+  objectSchema,
+  stringArraySchema,
+  stringSchema,
+} from "./schema.ts";
 
 interface DelegateParams {
   project: string;
   kind: TaskKind;
   instruction: string;
+  title?: string;
   review?: boolean;
+  base_ref?: string;
+  use_committed_head?: boolean;
+  source_label?: string;
+  source_revision?: string;
+  source_ref?: string;
   project_name?: string;
   project_location?: string;
   remote_action?: "clone" | "review_only";
@@ -43,12 +81,30 @@ interface ResolveDecisionParams extends TaskParams {
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 const SUPERVISOR_TOOLS = [
+  "switchyard_list_projects",
+  "switchyard_get_project",
+  "switchyard_register_project",
+  "switchyard_create_project",
+  "switchyard_rename_project",
+  "switchyard_unregister_project",
+  "switchyard_relocate_project",
+  "switchyard_list_remotes",
+  "switchyard_add_remote",
+  "switchyard_update_remote",
+  "switchyard_remove_remote",
+  "switchyard_resolve_remote_revision",
   "switchyard_delegate",
   "switchyard_list_tasks",
   "switchyard_get_task",
   "switchyard_send_message",
   "switchyard_resolve_decision",
   "switchyard_cancel_task",
+  "switchyard_rename_task",
+  "switchyard_land_task",
+  "switchyard_publish_task",
+  "switchyard_show_worker",
+  "switchyard_show_reviewer",
+  "switchyard_return_to_supervisor",
 ];
 
 export default function supervisorExtension(pi: PiExtensionApi) {
@@ -69,6 +125,285 @@ export default function supervisorExtension(pi: PiExtensionApi) {
   };
 
   pi.registerTool({
+    name: "switchyard_list_projects",
+    label: "List Projects",
+    description:
+      "List registered and historical Projects with local paths, Git remotes, registration state, and recent Task summaries.",
+    parameters: objectSchema({}),
+    async execute() {
+      const { store } = await openSwitchYard();
+      try {
+        return result(
+          await Promise.all(
+            store.listAllProjects().map((project) => projectDetails(store, project)),
+          ),
+        );
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_get_project",
+    label: "Inspect Project",
+    description:
+      "Inspect a Project by exact display name or local path. Ask if the name is ambiguous.",
+    parameters: objectSchema({ project: stringSchema() }, ["project"]),
+    async execute(_id: string, params: { project: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listAllProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        return result(await projectDetails(store, match.project));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_register_project",
+    label: "Register local Project",
+    description:
+      "Register an existing local Git checkout. This operation never runs git init. Confirm identity replacement only after the human approves adopting a different repository at a registered path.",
+    parameters: objectSchema(
+      {
+        location: stringSchema(),
+        name: stringSchema(),
+        confirm_identity_change: booleanSchema(),
+      },
+      ["location"],
+    ),
+    async execute(
+      _id: string,
+      params: { location: string; name?: string; confirm_identity_change?: boolean },
+    ) {
+      const { paths, store } = await openSwitchYard();
+      try {
+        const project = await addProject(store, paths, params.location, params.name, {
+          ...(params.confirm_identity_change !== undefined
+            ? { confirmIdentityChange: params.confirm_identity_change }
+            : {}),
+        });
+        return result(await projectDetails(store, project));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_create_project",
+    label: "Create local Project",
+    description:
+      "Create a directory, initialize Git, and register an empty Project. Workers create project contents.",
+    parameters: objectSchema({ name: stringSchema(), location: stringSchema() }, [
+      "name",
+      "location",
+    ]),
+    async execute(_id: string, params: { name: string; location: string }) {
+      const { paths, store } = await openSwitchYard();
+      try {
+        const project = await createProject(store, paths, params.name, params.location);
+        return result(await projectDetails(store, project));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_rename_project",
+    label: "Rename Project",
+    description: "Change only a Project's display name; do not rename its checkout or Git remotes.",
+    parameters: objectSchema({ project: stringSchema(), name: stringSchema() }, [
+      "project",
+      "name",
+    ]),
+    async execute(_id: string, params: { project: string; name: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listAllProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        return result(
+          await projectDetails(store, await renameProject(store, match.project.id, params.name)),
+        );
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_unregister_project",
+    label: "Unregister Project",
+    description:
+      "Stop offering a Project for new work without deleting its checkout or history. Refuses active Tasks.",
+    parameters: objectSchema({ project: stringSchema() }, ["project"]),
+    async execute(_id: string, params: { project: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listAllProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        return result(await projectDetails(store, unregisterProject(store, match.project.id)));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_relocate_project",
+    label: "Relocate Project",
+    description: "Move a Project checkout when no nonterminal Task depends on it.",
+    parameters: objectSchema({ project: stringSchema(), location: stringSchema() }, [
+      "project",
+      "location",
+    ]),
+    async execute(_id: string, params: { project: string; location: string }) {
+      const { paths, store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listAllProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        return result(
+          await projectDetails(
+            store,
+            await relocateProject(store, paths, match.project.id, params.location),
+          ),
+        );
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_list_remotes",
+    label: "List Git remotes",
+    description: "Read Git fetch and push URLs from the registered checkout's Git configuration.",
+    parameters: objectSchema({ project: stringSchema() }, ["project"]),
+    async execute(_id: string, params: { project: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        return result({
+          project: projectReference(match.project),
+          remotes: await listProjectRemotes(store, match.project.id),
+        });
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_add_remote",
+    label: "Add Git remote",
+    description: "Add one named Git remote to the registered checkout.",
+    parameters: objectSchema(
+      { project: stringSchema(), name: stringSchema(), url: stringSchema() },
+      ["project", "name", "url"],
+    ),
+    async execute(_id: string, params: { project: string; name: string; url: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        await addProjectRemote(store, match.project.id, params.name, params.url);
+        return result({
+          project: projectReference(match.project),
+          remotes: await listProjectRemotes(store, match.project.id),
+        });
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_update_remote",
+    label: "Update Git remote",
+    description: "Update one fetch or push URL without changing other Git remotes.",
+    parameters: objectSchema(
+      {
+        project: stringSchema(),
+        name: stringSchema(),
+        url: stringSchema(),
+        direction: enumSchema(["fetch", "push"]),
+      },
+      ["project", "name", "url"],
+    ),
+    async execute(
+      _id: string,
+      params: { project: string; name: string; url: string; direction?: "fetch" | "push" },
+    ) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        await updateProjectRemote(
+          store,
+          match.project.id,
+          params.name,
+          params.url,
+          params.direction,
+        );
+        return result({
+          project: projectReference(match.project),
+          remotes: await listProjectRemotes(store, match.project.id),
+        });
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_remove_remote",
+    label: "Remove Git remote",
+    description: "Remove one named Git remote from the registered checkout.",
+    parameters: objectSchema({ project: stringSchema(), name: stringSchema() }, [
+      "project",
+      "name",
+    ]),
+    async execute(_id: string, params: { project: string; name: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveProject(store.listProjects(), params.project);
+        if (!match.project) return result(projectResolutionView(match));
+        await removeProjectRemote(store, match.project.id, params.name);
+        return result({
+          project: projectReference(match.project),
+          remotes: await listProjectRemotes(store, match.project.id),
+        });
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_resolve_remote_revision",
+    label: "Resolve remote Git ref",
+    description:
+      "Resolve a concrete remote Git ref to one commit SHA before transient inspection. This uses Git only and does not register the source.",
+    parameters: objectSchema({ remote: stringSchema(), ref: stringSchema() }, ["remote", "ref"]),
+    async execute(_id: string, params: { remote: string; ref: string }) {
+      try {
+        return result({
+          remote: params.remote,
+          ref: params.ref,
+          revision: await resolveRemoteRevision(params.remote, params.ref),
+        });
+      } catch (error) {
+        throw new Error(publicError(error));
+      }
+    },
+  });
+
+  pi.registerTool({
     name: "switchyard_delegate",
     label: "Delegate task",
     description:
@@ -82,6 +417,28 @@ export default function supervisorExtension(pi: PiExtensionApi) {
         },
         kind: enumSchema(["implement", "investigate"]),
         instruction: stringSchema(),
+        title: { ...stringSchema(), description: "Short human-facing Task title." },
+        base_ref: {
+          ...stringSchema(),
+          description: "Explicit Git ref to capture as the immutable Task base.",
+        },
+        use_committed_head: {
+          ...booleanSchema(),
+          description:
+            "Explicit acknowledgement that dirty local changes remain untouched and the Task uses committed HEAD.",
+        },
+        source_label: {
+          ...stringSchema(),
+          description: "Human source reference such as Foo PR #42.",
+        },
+        source_revision: {
+          ...stringSchema(),
+          description: "Full commit SHA for transient inspection; required for remote-only work.",
+        },
+        source_ref: {
+          ...stringSchema(),
+          description: "The remote Git ref used to fetch the pinned commit.",
+        },
         review: {
           ...booleanSchema(),
           description: "Review implementation Tasks by default; false opts out.",
@@ -120,11 +477,23 @@ export default function supervisorExtension(pi: PiExtensionApi) {
               });
             }
             reviewPolicyForTask(params.kind, params.review);
+            if (!params.source_revision) {
+              return result({
+                status: "source_revision_required",
+                source: params.source_label ?? params.project,
+                message:
+                  "Resolve the requested remote ref to a concrete commit SHA before starting transient work.",
+              });
+            }
             const task = createTransientInvestigation(
               store,
               paths,
               params.project,
               params.instruction,
+              params.title ?? params.instruction,
+              params.source_label ?? params.project,
+              params.source_revision,
+              params.source_ref,
             );
             try {
               await startTask(store, paths, task.id);
@@ -137,13 +506,13 @@ export default function supervisorExtension(pi: PiExtensionApi) {
                   task.id,
                   `worker startup failed: ${error instanceof Error ? error.message : String(error)}`,
                 );
-                await quiesceTaskRuntimes(store, task.id);
+                await quiesceTaskRuntimes(store, task.id, {}, paths);
               }
             }
             const finalTask = store.getTask(task.id) ?? task;
             return result({
               status: finalTask.state === "failed" ? "task_failed" : "task_started",
-              source: params.project,
+              source: params.source_label ?? params.project,
               registered: false,
               task_started: finalTask.state === "running",
               task: taskView(store, finalTask),
@@ -193,12 +562,28 @@ export default function supervisorExtension(pi: PiExtensionApi) {
           project = await addProject(store, paths, params.project_location, params.project_name);
         }
 
+        const projectRoot = await validateProjectCheckout(store, project);
+        if ((await projectHasChanges(projectRoot)) && !params.use_committed_head) {
+          return result({
+            status: "dirty_project_confirmation",
+            project: project.name,
+            path: projectRoot,
+            message: `${project.name} has uncommitted local changes. Confirm that work should start from committed HEAD and those changes must remain untouched.`,
+            branch: (await inspectProject(store, project.id)).branch,
+          });
+        }
+
         const task = createTask(
           store,
           project.id,
           params.kind,
           params.instruction,
           reviewPolicyForTask(params.kind, params.review),
+          params.title ?? params.instruction,
+          {
+            ...(params.base_ref ? { baseRef: params.base_ref } : {}),
+            dirtyAcknowledged: params.use_committed_head ?? false,
+          },
         );
         try {
           await startTask(store, paths, task.id);
@@ -211,7 +596,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
               task.id,
               `worker startup failed: ${error instanceof Error ? error.message : String(error)}`,
             );
-            await quiesceTaskRuntimes(store, task.id);
+            await quiesceTaskRuntimes(store, task.id, {}, paths);
           }
         }
         return result(taskView(store, store.getTask(task.id) ?? task));
@@ -264,9 +649,15 @@ export default function supervisorExtension(pi: PiExtensionApi) {
       try {
         const match = resolveTask(store, params.task);
         if (!match.task) return result(taskResolutionView(store, match));
+        const wasReviewing = match.task.state === "reviewing";
         const task = steerTask(store, match.task.id, params.text);
-        await wakeWorker(store, paths, task.id);
-        return result(taskView(store, task));
+        if (!wasReviewing) await wakeWorker(store, paths, task.id);
+        return result({
+          ...taskView(store, task),
+          steering: wasReviewing
+            ? "queued until the active Review reaches its safe boundary"
+            : "delivered to the Worker",
+        });
       } catch (error) {
         throw new Error(publicError(error));
       } finally {
@@ -312,18 +703,171 @@ export default function supervisorExtension(pi: PiExtensionApi) {
       "Cancel a Task by its Project name or natural description while preserving its Workspace.",
     parameters: objectSchema({ task: stringSchema() }, ["task"]),
     async execute(_id: string, params: TaskParams) {
-      const { store } = await openSwitchYard();
+      const { paths, store } = await openSwitchYard();
       try {
         const match = resolveTask(store, params.task);
         if (!match.task) return result(taskResolutionView(store, match));
         const task = cancelTask(store, match.task.id);
-        await quiesceTaskRuntimes(store, task.id);
+        await quiesceTaskRuntimes(store, task.id, {}, paths);
         return result(taskView(store, task));
       } catch (error) {
         throw new Error(publicError(error));
       } finally {
         store.close();
       }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_rename_task",
+    label: "Rename Task",
+    description:
+      "Change a Task's human-facing title without changing its internal identity or lifecycle state.",
+    parameters: objectSchema({ task: stringSchema(), title: stringSchema() }, ["task", "title"]),
+    async execute(_id: string, params: { task: string; title: string }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveTask(store, params.task);
+        if (!match.task) return result(taskResolutionView(store, match));
+        return result(taskView(store, updateTaskTitle(store, match.task.id, params.title)));
+      } catch (error) {
+        throw new Error(publicError(error));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_land_task",
+    label: "Land completed Task",
+    description:
+      "Fast-forward a completed candidate into its registered Project only after explicit human intent. Refuses dirty or diverged targets.",
+    parameters: objectSchema({ task: stringSchema() }, ["task"]),
+    async execute(_id: string, params: TaskParams) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveTask(store, params.task);
+        if (!match.task) return result(taskResolutionView(store, match));
+        const landed = await landCompletedTask(store, match.task.id);
+        if (landed.status === "diverged") {
+          return result({
+            status: landed.status,
+            project: landed.project,
+            branch: landed.branch,
+            message: `${landed.project} advanced beyond this Task's base. Do not merge or rebase automatically; offer a follow-up integration Task based on the current target.`,
+          });
+        }
+        return result({
+          status: landed.status,
+          project: landed.project,
+          branch: landed.branch,
+          workspace: landed.workspace,
+        });
+      } catch (error) {
+        throw new Error(publicError(error));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_publish_task",
+    label: "Publish completed candidate",
+    description:
+      "Push the exact completed candidate to human-selected Git remote(s) under a named branch. This does not open or merge a PR.",
+    parameters: objectSchema(
+      {
+        task: stringSchema(),
+        branch: stringSchema(),
+        remotes: stringArraySchema(),
+      },
+      ["task", "branch"],
+    ),
+    async execute(_id: string, params: { task: string; branch: string; remotes?: string[] }) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveTask(store, params.task);
+        if (!match.task) return result(taskResolutionView(store, match));
+        const publication = await publishCompletedTask(
+          store,
+          match.task.id,
+          params.branch,
+          params.remotes,
+        );
+        const failed = publication.targets.filter((target) => target.status === "failed");
+        return result({
+          project: publication.project,
+          branch: publication.branch,
+          targets: publication.targets,
+          status:
+            failed.length === 0
+              ? "published"
+              : failed.length === publication.targets.length
+                ? "failed"
+                : "partial",
+        });
+      } catch (error) {
+        throw new Error(publicError(error));
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_show_worker",
+    label: "Show Worker",
+    description:
+      "Switch the tmux client to a Worker window. This is navigation only and does not steer, stop, or replace the Worker.",
+    parameters: objectSchema({ task: stringSchema() }, ["task"]),
+    async execute(_id: string, params: TaskParams) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveTask(store, params.task);
+        if (!match.task) return result(taskResolutionView(store, match));
+        const worker = store.getLiveWorker(match.task.id);
+        if (!worker)
+          return result({ status: "no_live_worker", task: taskReference(store, match.task) });
+        await attachWindow(worker.tmux_window);
+        return result({ status: "showing_worker", task: taskReference(store, match.task) });
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_show_reviewer",
+    label: "Show Reviewer",
+    description: "Switch the tmux client to the active Reviewer window. This is navigation only.",
+    parameters: objectSchema({ task: stringSchema() }, ["task"]),
+    async execute(_id: string, params: TaskParams) {
+      const { store } = await openSwitchYard();
+      try {
+        const match = resolveTask(store, params.task);
+        if (!match.task) return result(taskResolutionView(store, match));
+        const review = store.getLatestReview(match.task.id);
+        if (review?.state !== "running")
+          return result({ status: "no_active_reviewer", task: taskReference(store, match.task) });
+        await attachWindow(review.tmux_window);
+        return result({ status: "showing_reviewer", task: taskReference(store, match.task) });
+      } finally {
+        store.close();
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "switchyard_return_to_supervisor",
+    label: "Return to Supervisor",
+    description:
+      "Switch the tmux client back to the Supervisor window without changing runtime state.",
+    parameters: objectSchema({}),
+    async execute() {
+      await attachWindow("supervisor");
+      return result({ status: "showing_supervisor" });
     },
   });
 
@@ -415,21 +959,20 @@ function resolveProject(
   projects: ProjectRecord[],
   reference: string,
 ): { project?: ProjectRecord; matches?: ProjectRecord[] } {
-  const value = reference.trim().toLocaleLowerCase();
+  const trimmed = reference.trim();
+  const byId = projects.find((project) => project.id === trimmed);
+  if (byId) return { project: byId };
+  const value = trimmed.toLocaleLowerCase();
   const named = projects.filter((project) => project.name.trim().toLocaleLowerCase() === value);
   const namedMatch = sole(named);
   if (namedMatch) return { project: namedMatch };
   if (named.length > 1) return { matches: named };
   const matchingPath = projects.filter(
-    (project) => path.resolve(project.root_path) === path.resolve(reference),
+    (project) => path.resolve(project.root_path) === resolveUserPath(reference),
   );
   const pathMatch = sole(matchingPath);
   if (pathMatch) return { project: pathMatch };
   if (matchingPath.length > 1) return { matches: matchingPath };
-  const matchingRemote = projects.filter((project) => project.remote_url === reference);
-  const remoteMatch = sole(matchingRemote);
-  if (remoteMatch) return { project: remoteMatch };
-  if (matchingRemote.length > 1) return { matches: matchingRemote };
   return {};
 }
 
@@ -454,7 +997,7 @@ function resolveTask(
   const matches = tasks.filter((task) => {
     const project = task.project_id ? store.getProject(task.project_id) : undefined;
     const haystack = normalize(
-      `${project?.name ?? task.source_url ?? ""} ${taskTitle(task)} ${task.instruction} ${task.summary ?? ""}`,
+      `${project?.name ?? task.source_label ?? task.source_url ?? ""} ${taskTitle(task)} ${task.instruction} ${task.summary ?? ""}`,
     );
     return haystack.includes(query) || terms.every((term) => haystack.includes(term));
   });
@@ -490,19 +1033,15 @@ function taskView(store: Awaited<ReturnType<typeof openSwitchYard>>["store"], ta
   const project = task.project_id ? store.getProject(task.project_id) : undefined;
   const decision = store.getOpenDecision(task.id);
   const review = store.getLatestReview(task.id);
-  const workspace = store.getWorkspace(task.id);
   return {
-    project: project?.name ?? task.source_url ?? "Transient source",
+    project: project?.name ?? task.source_label ?? "Transient source",
     task: taskTitle(task),
-    kind: task.kind,
-    state: task.state,
+    kind: task.kind === "implement" ? "Implementation" : "Investigation",
+    status: taskStatus(task.state),
     instruction: task.instruction,
     summary: task.summary,
     verification_summary: task.verification_summary,
     failure: task.failure,
-    created_at: task.created_at,
-    updated_at: task.updated_at,
-    workspace: workspace ? (workspace.provisioned ? "ready" : "provisioning") : "not reserved",
     decision: decision
       ? {
           question: decision.question,
@@ -510,10 +1049,31 @@ function taskView(store: Awaited<ReturnType<typeof openSwitchYard>>["store"], ta
           options: decision.options_json ? JSON.parse(decision.options_json) : null,
         }
       : null,
-    review: review
-      ? { state: review.state, candidate_sha: review.candidate_sha, summary: review.summary }
-      : null,
+    review: review ? { status: reviewStatus(review.state), summary: review.summary } : null,
   };
+}
+
+function taskStatus(state: TaskRecord["state"]): string {
+  return {
+    queued: "Queued",
+    starting: "Starting",
+    running: "Working",
+    waiting: "Waiting for input",
+    needs_decision: "Needs your decision",
+    reviewing: "Under implementation review",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+  }[state];
+}
+
+function reviewStatus(state: ReviewRecord["state"]): string {
+  return {
+    running: "Under review",
+    changes_requested: "Changes requested",
+    clean: "Passed",
+    failed: "Failed",
+  }[state];
 }
 
 function taskTitle(task: TaskRecord): string {
@@ -526,11 +1086,66 @@ function taskReference(
   task: TaskRecord,
 ): string {
   const project = task.project_id ? store.getProject(task.project_id) : undefined;
-  return `${project?.name ?? task.source_url ?? "Transient source"} / ${taskTitle(task)}`;
+  return `${project?.name ?? task.source_label ?? "Transient source"} / ${taskTitle(task)}`;
 }
 
 function projectView(project: ProjectRecord) {
-  return { name: project.name, location: project.root_path, remote: project.remote_url };
+  return {
+    name: project.name,
+    location: project.root_path,
+    registration_state: project.registration_state,
+  };
+}
+
+function projectReference(project: ProjectRecord): string {
+  return `${project.name} (${project.root_path})`;
+}
+
+function projectResolutionView(match: { matches?: ProjectRecord[] }) {
+  if (match.matches?.length) {
+    return {
+      status: "ambiguous_project",
+      message: "Several Projects have that display name. Choose one by its local path.",
+      matches: match.matches.map(projectView),
+    };
+  }
+  return {
+    status: "project_not_found",
+    message: "No Project matches that exact name or local path.",
+  };
+}
+
+async function projectDetails(
+  store: Awaited<ReturnType<typeof openSwitchYard>>["store"],
+  project: ProjectRecord,
+) {
+  const recent_tasks = store
+    .listTasks()
+    .filter((task) => task.project_id === project.id)
+    .slice(0, 4)
+    .map((task) => ({
+      title: taskTitle(task),
+      kind: task.kind === "implement" ? "Implementation" : "Investigation",
+      status: taskStatus(task.state),
+      summary: task.summary,
+    }));
+  if (project.registration_state !== "registered") return { ...projectView(project), recent_tasks };
+  try {
+    const facts = await inspectProject(store, project.id);
+    return {
+      ...projectView(facts.project),
+      branch: facts.branch,
+      dirty: facts.dirty,
+      remotes: facts.remotes,
+      recent_tasks,
+    };
+  } catch (error) {
+    return {
+      ...projectView(project),
+      checkout_error: publicError(error),
+      recent_tasks,
+    };
+  }
 }
 
 function humanizeMessage(

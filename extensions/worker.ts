@@ -2,7 +2,7 @@ import { openSwitchYard } from "../src/context.ts";
 import { markDelivered, startWakePump } from "../src/inbox.ts";
 import { beginReview } from "../src/review.ts";
 import { retireWorker, startReviewer, wakeSupervisor } from "../src/runtime.ts";
-import type { StateStore, TaskState } from "../src/state.ts";
+import type { StateStore, TaskRecord } from "../src/state.ts";
 import { markWaiting, requestDecision, submitCandidate } from "../src/tasks.ts";
 import type { PiExtensionApi } from "./pi-types.ts";
 import { objectSchema, stringArraySchema, stringSchema } from "./schema.ts";
@@ -22,11 +22,18 @@ interface WaitParams {
   reason: string;
 }
 
-const WORKER_TOOLS = [
+const IMPLEMENTATION_TOOLS = [
   "read",
   "bash",
   "edit",
   "write",
+  "switchyard_complete",
+  "switchyard_request_decision",
+  "switchyard_wait",
+];
+
+const INVESTIGATION_TOOLS = [
+  "read",
   "switchyard_complete",
   "switchyard_request_decision",
   "switchyard_wait",
@@ -65,7 +72,7 @@ export default function workerExtension(pi: PiExtensionApi) {
           params.verification_summary,
         );
         if (submitted.task.state === "reviewing") {
-          setToolsForState(pi, "reviewing");
+          setToolsForState(pi, store.getTask(taskId));
           const reviewId = await beginReview(store, paths, taskId);
           await startReviewer(store, paths, reviewId);
           await wakeSupervisor(paths);
@@ -105,7 +112,7 @@ export default function workerExtension(pi: PiExtensionApi) {
           params.context,
           params.options,
         );
-        setToolsForState(pi, "needs_decision");
+        setToolsForState(pi, store.getTask(taskId));
         await wakeSupervisor(paths);
         return result({ decision_id: decisionId });
       } finally {
@@ -125,7 +132,7 @@ export default function workerExtension(pi: PiExtensionApi) {
       try {
         assertActiveWorker(store);
         const task = markWaiting(store, taskId, params.reason);
-        setToolsForState(pi, task.state);
+        setToolsForState(pi, task);
         await wakeSupervisor(paths);
         return result(task);
       } finally {
@@ -146,7 +153,7 @@ export default function workerExtension(pi: PiExtensionApi) {
         }
         const task = store.getTask(taskId);
         if (!task) return;
-        setToolsForState(pi, task.state);
+        setToolsForState(pi, task);
         if (task.state !== "running") return;
         const messages = store
           .listPendingMessages(taskId, "worker")
@@ -170,10 +177,22 @@ export default function workerExtension(pi: PiExtensionApi) {
 
   pi.on("tool_call", async (event) => {
     const toolName = (event as { toolName?: string } | undefined)?.toolName;
-    if (!toolName || !["read", "bash", "edit", "write"].includes(toolName)) return undefined;
+    if (!toolName) return undefined;
     const { store } = await openSwitchYard();
     try {
       const task = store.getTask(taskId);
+      const allowedTools =
+        task?.kind === "investigate" ? INVESTIGATION_TOOLS : IMPLEMENTATION_TOOLS;
+      if (!allowedTools.includes(toolName)) {
+        return { block: true, reason: "Worker authority is limited to its Task-specific tools." };
+      }
+      if (task?.kind === "investigate" && ["bash", "edit", "write"].includes(toolName)) {
+        return {
+          block: true,
+          reason: "Investigation Tasks are read-only; use the inspection and lifecycle tools only.",
+        };
+      }
+      if (!["read", "bash", "edit", "write"].includes(toolName)) return undefined;
       if (task?.state === "running" && store.getActiveWorker(taskId)?.id === workerId)
         return undefined;
       return {
@@ -189,7 +208,7 @@ export default function workerExtension(pi: PiExtensionApi) {
     const { paths, store } = await openSwitchYard();
     try {
       const task = store.getTask(taskId);
-      setToolsForState(pi, task?.state ?? "failed");
+      setToolsForState(pi, task);
       store.event(taskId, "worker.session_started", { worker_id: workerId });
       stopWakePump ??= startWakePump(paths.wake, `worker-${workerId}.wake`, deliverPending);
     } finally {
@@ -248,8 +267,12 @@ export default function workerExtension(pi: PiExtensionApi) {
   }
 }
 
-function setToolsForState(pi: PiExtensionApi, state: TaskState): void {
-  pi.setActiveTools(state === "running" ? WORKER_TOOLS : []);
+function setToolsForState(pi: PiExtensionApi, task: TaskRecord | undefined): void {
+  if (task?.state !== "running") {
+    pi.setActiveTools([]);
+    return;
+  }
+  pi.setActiveTools(task.kind === "investigate" ? INVESTIGATION_TOOLS : IMPLEMENTATION_TOOLS);
 }
 
 function requiredEnv(name: string): string {

@@ -38,18 +38,19 @@ export default function reviewerExtension(pi: PiExtensionApi) {
         const review = store.getReview(reviewId);
         if (!review) throw new Error("review not found");
         await submitReview(store, reviewId, params);
-        if (params.verdict === "changes_requested") {
+        const task = store.getTask(review.task_id);
+        if (params.verdict === "changes_requested" || task?.state === "running") {
           await replaceWorker(store, paths, review.task_id);
           await wakeWorker(store, paths, review.task_id);
         } else {
-          await quiesceTaskRuntimes(store, review.task_id, { keepReviewId: reviewId });
+          await quiesceTaskRuntimes(store, review.task_id, { keepReviewId: reviewId }, paths);
         }
         pi.setActiveTools([]);
         await wakeSupervisor(paths);
         ctx?.shutdown();
         return {
-          content: [{ type: "text", text: `Review ${reviewId} accepted as ${params.verdict}` }],
-          details: { review_id: reviewId, verdict: params.verdict },
+          content: [{ type: "text", text: `Review submitted: ${params.verdict}` }],
+          details: { verdict: params.verdict },
         };
       } finally {
         store.close();

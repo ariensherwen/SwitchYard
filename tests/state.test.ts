@@ -41,7 +41,7 @@ test("migrations are repeatable and durable", async () => {
   assert.equal(reopened.listTasks().length, 1);
   assert.equal(
     (reopened.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-    5,
+    9,
   );
   reopened.close();
 });
@@ -162,6 +162,18 @@ test("Task titles are persisted independently from completion summaries and muta
   updateTaskTitle(store, task.id, "Stable task title");
   assert.equal(store.getTask(task.id)?.title, "Stable task title");
   assert.ok(store.listEvents(task.id).some((event) => event.type === "task.title_updated"));
+  store.close();
+});
+
+test("captured Task base refs cannot be moved", async () => {
+  const store = await fixture();
+  const task = createTask(store, "p", "implement", "change x", "off", "A task", {
+    baseRef: "main",
+  });
+  assert.throws(
+    () => store.db.prepare("UPDATE tasks SET base_ref='release' WHERE id=?").run(task.id),
+    /task base ref is immutable/,
+  );
   store.close();
 });
 
