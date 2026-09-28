@@ -126,9 +126,9 @@ export async function startTask(
   taskId: string,
   hooks: TaskStartupHooks = {},
 ): Promise<TaskRecord> {
-  const task = requiredTask(store, taskId);
-  if (task.state !== "queued" && task.state !== "starting")
-    throw new Error(`task ${taskId} is ${task.state}, expected queued or starting`);
+  let task = requiredTask(store, taskId);
+  if (task.state !== "queued" && task.state !== "starting" && task.state !== "running")
+    throw new Error(`task ${taskId} is ${task.state}, expected queued, starting, or running`);
   const project = task.project_id ? store.getProject(task.project_id) : undefined;
   if (task.project_id && !project) throw new Error(`project not found: ${task.project_id}`);
   let sourceRoot: string;
@@ -152,69 +152,161 @@ export async function startTask(
   let workspace = store.getWorkspace(taskId);
   let reserved = false;
 
+  if (task.state === "running") {
+    if (workspace?.provisioned === 1) return task;
+    throw new Error(`running task ${taskId} has no provisioned Workspace`);
+  }
+
   if (task.state === "queued") {
     const baseSha = await taskWorkspaceBase(sourceRoot, workspacePath, branch);
     store.transaction(() => {
-      casTransition(store, taskId, "queued", "starting");
-      if (!workspace) {
+      const current = requiredTask(store, taskId);
+      if (current.state === "queued") {
+        casTransition(store, taskId, "queued", "starting");
+        if (!store.getWorkspace(taskId)) {
+          store.db
+            .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
+              VALUES (?, ?, ?, 0, ?)`)
+            .run(taskId, workspacePath, branch, now());
+          store.event(taskId, "workspace.reserved", {
+            path: workspacePath,
+            branch,
+            base_sha: baseSha,
+          });
+        }
+        store.db
+          .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
+          .run(baseSha, now(), taskId);
+        store.event(taskId, "task.starting");
+        reserved = true;
+      } else if (current.state === "starting" && !store.getWorkspace(taskId)) {
+        const recoveredBaseSha = current.base_sha ?? baseSha;
         store.db
           .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
             VALUES (?, ?, ?, 0, ?)`)
           .run(taskId, workspacePath, branch, now());
+        store.db
+          .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
+          .run(recoveredBaseSha, now(), taskId);
         store.event(taskId, "workspace.reserved", {
           path: workspacePath,
           branch,
-          base_sha: baseSha,
+          base_sha: recoveredBaseSha,
+          recovered: true,
         });
+        reserved = true;
+      } else if (current.state !== "starting" && current.state !== "running") {
+        throw new Error(`task ${taskId} is ${current.state}, expected queued or starting`);
       }
-      store.db
-        .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
-        .run(baseSha, now(), taskId);
-      store.event(taskId, "task.starting");
     });
+    task = requiredTask(store, taskId);
     workspace = store.getWorkspace(taskId);
-    reserved = true;
+    if (task.state === "running" && workspace?.provisioned === 1) return task;
   } else if (task.state === "starting" && !workspace) {
     const baseSha = task.base_sha ?? (await taskWorkspaceBase(sourceRoot, workspacePath, branch));
     store.transaction(() => {
       const current = requiredTask(store, taskId);
-      if (current.state !== "starting")
-        throw new Error(`task is ${current.state}, expected starting`);
-      store.db
-        .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
-          VALUES (?, ?, ?, 0, ?)`)
-        .run(taskId, workspacePath, branch, now());
-      store.db
-        .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
-        .run(baseSha, now(), taskId);
-      store.event(taskId, "workspace.reserved", {
-        path: workspacePath,
-        branch,
-        base_sha: baseSha,
-        recovered: true,
-      });
+      if (current.state === "starting" && !store.getWorkspace(taskId)) {
+        store.db
+          .prepare(`INSERT INTO workspaces(task_id, path, branch, provisioned, created_at)
+            VALUES (?, ?, ?, 0, ?)`)
+          .run(taskId, workspacePath, branch, now());
+        store.db
+          .prepare("UPDATE tasks SET base_sha=?, updated_at=? WHERE id=? AND state='starting'")
+          .run(baseSha, now(), taskId);
+        store.event(taskId, "workspace.reserved", {
+          path: workspacePath,
+          branch,
+          base_sha: baseSha,
+          recovered: true,
+        });
+        reserved = true;
+      } else if (current.state !== "starting" && current.state !== "running") {
+        throw new Error(`task ${taskId} is ${current.state}, expected starting`);
+      }
     });
+    task = requiredTask(store, taskId);
     workspace = store.getWorkspace(taskId);
-    reserved = true;
-  } else if (task.state !== "starting") {
-    throw new Error(`task ${taskId} is ${task.state}, expected queued or starting`);
+    if (task.state === "running" && workspace?.provisioned === 1) return task;
   }
 
   if (!workspace) throw new Error("task workspace reservation is missing");
   if (reserved) await hooks.afterReservation?.();
-  if (workspace.provisioned === 0) {
-    const baseSha = store.getTask(taskId)?.base_sha;
-    if (!baseSha) throw new Error("task workspace base revision is missing");
+  if (workspace.provisioned === 1) return requiredTask(store, taskId);
+  task = requiredTask(store, taskId);
+  if (task.state !== "starting")
+    throw new Error(`task ${taskId} is ${task.state}, expected starting`);
+  const baseSha = task.base_sha;
+  if (!baseSha) throw new Error("task workspace base revision is missing");
+
+  const claim = claimWorkspaceProvision(store, taskId);
+  if (claim.status !== "owner") return requiredTask(store, taskId);
+  try {
     await ensureTaskWorkspace(sourceRoot, workspace.path, workspace.branch, baseSha);
     await hooks.afterWorktreeProvisioned?.();
     store.transaction(() => {
       const changed = store.db
-        .prepare("UPDATE workspaces SET provisioned=1 WHERE task_id=? AND provisioned=0")
-        .run(taskId);
-      if (changed.changes === 1) store.event(taskId, "workspace.provisioned", { branch });
+        .prepare(`UPDATE workspaces SET provisioned=1, provisioner_pid=NULL, provisioner_token=NULL
+          WHERE task_id=? AND provisioned=0 AND provisioner_token=?`)
+        .run(taskId, claim.token);
+      if (changed.changes === 1) {
+        store.event(taskId, "workspace.provisioned", { branch });
+      } else if (store.getWorkspace(taskId)?.provisioned !== 1) {
+        throw new Error("task Workspace startup claim was lost");
+      }
     });
+  } catch (error) {
+    clearWorkspaceProvisionClaim(store, taskId, claim.token);
+    throw error;
   }
   return requiredTask(store, taskId);
+}
+
+function claimWorkspaceProvision(
+  store: StateStore,
+  taskId: string,
+): { status: "ready" | "busy" } | { status: "owner"; token: string } {
+  return store.transaction(() => {
+    const task = requiredTask(store, taskId);
+    const workspace = store.getWorkspace(taskId);
+    if (!workspace) throw new Error("task workspace reservation is missing");
+    if (workspace.provisioned === 1) return { status: "ready" };
+    if (task.state !== "starting")
+      throw new Error(`task ${taskId} is ${task.state}, expected starting`);
+    if (workspace.provisioner_token && processIsAlive(workspace.provisioner_pid))
+      return { status: "busy" };
+
+    const token = randomUUID();
+    const changed = store.db
+      .prepare(`UPDATE workspaces SET provisioner_pid=?, provisioner_token=?
+        WHERE task_id=? AND provisioned=0`)
+      .run(process.pid, token, taskId);
+    if (changed.changes !== 1) {
+      const current = store.getWorkspace(taskId);
+      if (current?.provisioned === 1) return { status: "ready" };
+      throw new Error("failed to claim task Workspace startup");
+    }
+    return { status: "owner", token };
+  });
+}
+
+function clearWorkspaceProvisionClaim(store: StateStore, taskId: string, token: string): void {
+  store.transaction(() => {
+    store.db
+      .prepare(`UPDATE workspaces SET provisioner_pid=NULL, provisioner_token=NULL
+        WHERE task_id=? AND provisioner_token=?`)
+      .run(taskId, token);
+  });
+}
+
+function processIsAlive(pid: number | null): boolean {
+  if (pid === null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 export function markRunning(store: StateStore, taskId: string): TaskRecord {
@@ -478,7 +570,8 @@ export function terminateActiveReviews(
     .prepare("SELECT id FROM reviews WHERE task_id=? AND state='running'")
     .all(taskId) as Array<{ id: string }>;
   const update = store.db.prepare(`UPDATE reviews SET state='failed', summary=?, completed_at=?,
-    startup_reserved=0, runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND state='running'`);
+    startup_reserved=0, runtime_starting=0, runtime_starter_pid=NULL, runtime_startup_token=NULL
+    WHERE id=? AND state='running'`);
   for (const review of reviews) {
     const reason = `Review aborted because Task became ${terminalState}`;
     if (update.run(reason, now(), review.id).changes === 1) {

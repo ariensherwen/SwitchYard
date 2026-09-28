@@ -134,7 +134,7 @@ test("replacement activation cannot cross cancellation on another StateStore con
   assert.equal(store.getTask(task.id)?.state, "cancelled");
   assert.equal(store.getLiveWorker(task.id), undefined);
   assert.equal(store.listWorkers(task.id)[0]?.state, "stopped");
-  assert.equal((await readFile(stateFile, "utf8")).trim(), "");
+  assert.equal(existsSync(stateFile) ? (await readFile(stateFile, "utf8")).trim() : "", "");
   cancellingStore.close();
   store.close();
 });
@@ -257,6 +257,58 @@ test("recovery starts a Task left queued by a crash after creation", async () =>
   store.close();
 });
 
+test("CLI Workspace startup and reconciliation adopt one cross-connection provisioning claim", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "concurrent startup", "off");
+  const reconcilerStore = new StateStore(paths.database);
+  let reachedProvisioned!: () => void;
+  let releaseProvisioning!: () => void;
+  const provisioned = new Promise<void>((resolve) => {
+    reachedProvisioned = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    releaseProvisioning = resolve;
+  });
+  const cliStartup = (async () => {
+    await startTask(store, paths, task.id, {
+      afterWorktreeProvisioned: async () => {
+        reachedProvisioned();
+        await gate;
+      },
+    });
+    if (
+      store.getTask(task.id)?.state === "starting" &&
+      store.getWorkspace(task.id)?.provisioned === 1
+    )
+      await startWorker(store, paths, task.id);
+  })();
+
+  await provisioned;
+  const claim = store.getWorkspace(task.id);
+  assert.equal(claim?.provisioned, 0);
+  assert.equal(claim?.provisioner_pid, process.pid);
+  assert.ok(claim?.provisioner_token);
+  const { reconcile } = await import("../src/reconcile.ts");
+  await reconcile(reconcilerStore, paths);
+
+  assert.equal(reconcilerStore.getTask(task.id)?.state, "starting");
+  assert.equal(reconcilerStore.getLiveWorker(task.id), undefined);
+  assert.equal(reconcilerStore.getWorkspace(task.id)?.provisioned, 0);
+  releaseProvisioning();
+  await cliStartup;
+
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.equal(store.getWorkspace(task.id)?.provisioned, 1);
+  assert.ok(store.getActiveWorker(task.id));
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "worker.reserved").length,
+    1,
+  );
+  assert.equal((await readFile(stateFile, "utf8")).trim().split(/\r?\n/).length, 1);
+  reconcilerStore.close();
+  store.close();
+});
+
 test("recovery provisions a reserved Workspace after a crash before git worktree add", async () => {
   const { paths, store } = await fixture();
   const task = createTask(store, "p", "implement", "reserved recovery", "off");
@@ -301,6 +353,9 @@ test("recovery adopts a created Workspace after a crash before readiness persist
   assert.equal(store.getTask(task.id)?.state, "starting");
   assert.equal(reservation?.provisioned, 0);
   assert.equal(reservation ? existsSync(reservation.path) : false, true);
+  store.db
+    .prepare("UPDATE workspaces SET provisioner_pid=?, provisioner_token=? WHERE task_id=?")
+    .run(2_147_483_647, "crashed-owner", task.id);
   store.close();
 
   const recovered = new StateStore(paths.database);
@@ -317,6 +372,50 @@ test("recovery adopts a created Workspace after a crash before readiness persist
   ).stdout;
   assert.equal(worktrees.match(/worktree /g)?.length, 2);
   recovered.close();
+});
+
+test("CLI Worker startup and reconciliation adopt one cross-connection reservation", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "concurrent Worker startup", "off");
+  await startTask(store, paths, task.id);
+  const reconcilerStore = new StateStore(paths.database);
+  let reachedClaim!: () => void;
+  let releaseClaim!: () => void;
+  const claimed = new Promise<void>((resolve) => {
+    reachedClaim = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    releaseClaim = resolve;
+  });
+  const cliStartup = startWorker(store, paths, task.id, {
+    afterClaim: async () => {
+      reachedClaim();
+      await gate;
+    },
+  });
+
+  await claimed;
+  const reserved = store.getLiveWorker(task.id);
+  assert.equal(reserved?.state, "starting");
+  assert.equal(reserved?.runtime_starting, 1);
+  assert.equal(reserved?.runtime_starter_pid, process.pid);
+  const { reconcile } = await import("../src/reconcile.ts");
+  await reconcile(reconcilerStore, paths);
+  assert.equal(reconcilerStore.getTask(task.id)?.state, "starting");
+  assert.equal(reconcilerStore.getLiveWorker(task.id)?.id, reserved?.id);
+
+  releaseClaim();
+  assert.equal(await cliStartup, reserved?.id);
+  assert.equal(store.getTask(task.id)?.state, "running");
+  assert.equal(store.getActiveWorker(task.id)?.id, reserved?.id);
+  assert.equal(store.listWorkers(task.id).length, 1);
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "worker.reserved").length,
+    1,
+  );
+  assert.equal((await readFile(stateFile, "utf8")).trim().split(/\r?\n/).length, 1);
+  reconcilerStore.close();
+  store.close();
 });
 
 test("Worker identity is durable and original instruction is queued before runtime activation", async () => {
@@ -341,10 +440,11 @@ test("recovery launches the exact reserved Worker identity after crash-before-sp
   await startTask(store, paths, task.id);
   const workerId = "reserved-worker";
   store.db
-    .prepare(
-      "INSERT INTO workers(id, task_id, state, tmux_window, created_at) VALUES (?, ?, 'starting', ?, ?)",
-    )
-    .run(workerId, task.id, `task-${task.id}`, now());
+    .prepare(`INSERT INTO workers(
+      id, task_id, state, tmux_window, created_at, runtime_starting,
+      runtime_starter_pid, runtime_startup_token
+    ) VALUES (?, ?, 'starting', ?, ?, 1, ?, ?)`)
+    .run(workerId, task.id, `task-${task.id}`, now(), 2_147_483_647, "crashed-owner");
   enqueueMessage(
     store,
     task.id,
@@ -358,6 +458,7 @@ test("recovery launches the exact reserved Worker identity after crash-before-sp
 
   assert.equal(store.getTask(task.id)?.state, "running");
   assert.equal(store.getActiveWorker(task.id)?.id, workerId);
+  assert.equal(store.getActiveWorker(task.id)?.runtime_starting, 0);
   assert.deepEqual(
     store.listWorkers(task.id).map((row) => row.id),
     [workerId],
@@ -438,6 +539,80 @@ test("cancelling or failing during review aborts the Review and removes its work
       store.close();
     });
   }
+});
+
+test("Reviewer startup revalidates its claim after cancellation before spawn", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "cancel during reviewer preparation", "loop");
+  await startTask(store, paths, task.id);
+  markRunning(store, task.id);
+  const workspace = store.getWorkspace(task.id);
+  assert.ok(workspace);
+  await writeFile(path.join(workspace.path, "README.md"), "candidate\n");
+  await exec("git", ["add", "README.md"], { cwd: workspace.path });
+  await exec("git", ["commit", "-m", "candidate"], { cwd: workspace.path });
+  await submitCandidate(store, task.id, "candidate", "verified");
+  const reviewId = await beginReview(store, paths, task.id);
+  const cancellingStore = new StateStore(paths.database);
+  const review = store.getReview(reviewId);
+  assert.ok(review);
+
+  await assert.rejects(
+    startReviewer(store, paths, reviewId, {
+      beforeLaunch: async () => {
+        cancelTask(cancellingStore, task.id);
+        await quiesceTaskRuntimes(cancellingStore, task.id);
+      },
+    }),
+    /Reviewer startup claim was lost/,
+  );
+
+  assert.equal(store.getTask(task.id)?.state, "cancelled");
+  assert.equal(store.getReview(reviewId)?.state, "failed");
+  assert.equal(store.getReview(reviewId)?.runtime_starting, 0);
+  assert.equal(store.getReview(reviewId)?.runtime_startup_token, null);
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "reviewer.started").length,
+    0,
+  );
+  assert.equal(existsSync(stateFile) ? (await readFile(stateFile, "utf8")).trim() : "", "");
+  cancellingStore.close();
+  store.close();
+});
+
+test("Reviewer runtime is killed if cancellation wins after spawn", async () => {
+  const { paths, store, stateFile } = await fixture();
+  const task = createTask(store, "p", "implement", "cancel after reviewer spawn", "loop");
+  await startTask(store, paths, task.id);
+  markRunning(store, task.id);
+  const workspace = store.getWorkspace(task.id);
+  assert.ok(workspace);
+  await writeFile(path.join(workspace.path, "README.md"), "candidate\n");
+  await exec("git", ["add", "README.md"], { cwd: workspace.path });
+  await exec("git", ["commit", "-m", "candidate"], { cwd: workspace.path });
+  await submitCandidate(store, task.id, "candidate", "verified");
+  const reviewId = await beginReview(store, paths, task.id);
+  const cancellingStore = new StateStore(paths.database);
+
+  await assert.rejects(
+    startReviewer(store, paths, reviewId, {
+      afterLaunch: async () => {
+        cancelTask(cancellingStore, task.id);
+        await quiesceTaskRuntimes(cancellingStore, task.id);
+      },
+    }),
+    /Reviewer startup claim was lost/,
+  );
+
+  assert.equal(store.getTask(task.id)?.state, "cancelled");
+  assert.equal(store.getReview(reviewId)?.state, "failed");
+  assert.equal(
+    store.listEvents(task.id).filter((event) => event.type === "reviewer.started").length,
+    0,
+  );
+  assert.equal((await readFile(stateFile, "utf8")).trim(), "");
+  cancellingStore.close();
+  store.close();
 });
 
 test("concurrent Reviewer launches share one durable startup owner", async () => {

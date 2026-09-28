@@ -57,17 +57,16 @@ async function reconcileTask(
     return;
   }
 
-  if (task.state === "queued") {
+  if (task.state === "queued" || task.state === "starting") {
     await startTask(store, paths, task.id);
-    await startWorker(store, paths, task.id);
-    return;
-  }
-
-  if (task.state === "starting") {
-    await startTask(store, paths, task.id);
-    const worker = store.getLiveWorker(task.id);
-    if (worker?.state === "starting") await resumeReservedWorker(store, paths, worker);
-    else await startWorker(store, paths, task.id);
+    const current = store.getTask(task.id);
+    if (current?.state === "running") {
+      await reconcileTask(store, paths, current);
+    } else if (current?.state === "starting" && store.getWorkspace(task.id)?.provisioned === 1) {
+      const worker = store.getLiveWorker(task.id);
+      if (worker?.state === "starting") await resumeReservedWorker(store, paths, worker);
+      else await startWorker(store, paths, task.id);
+    }
     return;
   }
 

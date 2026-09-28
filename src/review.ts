@@ -119,7 +119,8 @@ export async function submitReview(
     const updated = store.db
       .prepare(
         `UPDATE reviews SET state=?, summary=?, completed_at=?, startup_reserved=0,
-          runtime_starting=0, runtime_starter_pid=NULL WHERE id=? AND state='running'`,
+          runtime_starting=0, runtime_starter_pid=NULL, runtime_startup_token=NULL
+          WHERE id=? AND state='running'`,
       )
       .run(state, submission.summary, now(), reviewId);
     if (updated.changes !== 1) throw new Error("review changed concurrently");
@@ -186,7 +187,7 @@ export function recordReviewRuntimeFailure(
       const changed = store.db
         .prepare(
           `UPDATE reviews SET attempts=attempts+1, runtime_starting=0,
-            runtime_starter_pid=NULL WHERE id=? AND state='running'`,
+            runtime_starter_pid=NULL, runtime_startup_token=NULL WHERE id=? AND state='running'`,
         )
         .run(reviewId);
       if (changed.changes !== 1) throw new Error("running review changed concurrently");
@@ -203,7 +204,7 @@ export function recordReviewRuntimeFailure(
     const changed = store.db
       .prepare(
         `UPDATE reviews SET state='failed', summary=?, completed_at=?, runtime_starting=0,
-          runtime_starter_pid=NULL WHERE id=? AND state='running'`,
+          runtime_starter_pid=NULL, runtime_startup_token=NULL WHERE id=? AND state='running'`,
       )
       .run(failure, now(), reviewId);
     if (changed.changes !== 1) throw new Error("running review changed concurrently");

@@ -47,6 +47,8 @@ export interface WorkspaceRecord {
   path: string;
   branch: string;
   provisioned: number;
+  provisioner_pid: number | null;
+  provisioner_token: string | null;
   created_at: string;
 }
 
@@ -55,6 +57,9 @@ export interface WorkerRecord {
   task_id: string;
   state: "starting" | "active" | "stopped";
   tmux_window: string;
+  runtime_starting: number;
+  runtime_starter_pid: number | null;
+  runtime_startup_token: string | null;
   created_at: string;
   ended_at: string | null;
 }
@@ -95,6 +100,7 @@ export interface ReviewRecord {
   startup_reserved: number;
   runtime_starting: number;
   runtime_starter_pid: number | null;
+  runtime_startup_token: string | null;
 }
 
 export interface FindingRecord {
@@ -115,7 +121,7 @@ export interface EventRecord {
   created_at: string;
 }
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export class StateStore {
   readonly db: DatabaseSync;
@@ -506,6 +512,31 @@ export class StateStore {
       }
       const violations = this.db.prepare("PRAGMA foreign_key_check").all();
       if (violations.length > 0) throw new Error("schema migration left foreign key violations");
+    }
+
+    if (row.user_version <= 4) {
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS workers (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            state TEXT NOT NULL CHECK(state IN ('starting','active','stopped')),
+            tmux_window TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            ended_at TEXT
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS one_live_worker_per_task
+            ON workers(task_id) WHERE state IN ('starting','active');
+          ALTER TABLE workspaces ADD COLUMN provisioner_pid INTEGER;
+          ALTER TABLE workspaces ADD COLUMN provisioner_token TEXT;
+          ALTER TABLE workers ADD COLUMN runtime_starting INTEGER NOT NULL DEFAULT 0
+            CHECK(runtime_starting IN (0,1));
+          ALTER TABLE workers ADD COLUMN runtime_starter_pid INTEGER;
+          ALTER TABLE workers ADD COLUMN runtime_startup_token TEXT;
+          ALTER TABLE reviews ADD COLUMN runtime_startup_token TEXT;
+          PRAGMA user_version = 5;
+        `);
+      });
     }
   }
 }

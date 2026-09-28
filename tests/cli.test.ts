@@ -7,6 +7,7 @@ import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ensureSwitchYardHome } from "../src/home.ts";
+import { reconcile } from "../src/reconcile.ts";
 import { now, StateStore } from "../src/state.ts";
 import { cancelTask, createTask, startTask } from "../src/tasks.ts";
 import { createWorkspace } from "../src/worktree.ts";
@@ -31,6 +32,19 @@ async function run(args: string[], env: NodeJS.ProcessEnv = process.env) {
     const e = error as { code?: number; stdout?: string; stderr?: string };
     return { code: e.code ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
   }
+}
+
+async function waitForFile(filePath: string, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(filePath);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  assert.fail(`timed out waiting for ${filePath}`);
 }
 
 test("help exposes the 0.1.0 task surface", async () => {
@@ -132,6 +146,73 @@ test("CLI reviews implement Tasks by default and supports explicit opt-out", asy
   );
   assert.equal(verified.listTasks().length, 3);
   verified.close();
+});
+
+test("CLI Task startup and reconciliation share the durable Workspace claim", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "switchyard-cli-startup-race-"));
+  dirs.push(rootDir);
+  const repo = path.join(rootDir, "repo");
+  const home = path.join(rootDir, "home");
+  const bin = path.join(rootDir, "bin");
+  const gateStarted = path.join(rootDir, "git-worktree-started");
+  const gateRelease = path.join(rootDir, "git-worktree-release");
+  const tmuxState = path.join(rootDir, "tmux-state");
+  await mkdir(repo);
+  await mkdir(bin);
+  await exec("git", ["init", "-b", "main"], { cwd: repo });
+  await exec("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  await exec("git", ["config", "user.name", "SwitchYard Test"], { cwd: repo });
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await exec("git", ["add", "."], { cwd: repo });
+  await exec("git", ["commit", "-m", "base"], { cwd: repo });
+  const paths = await ensureSwitchYardHome({ SWITCHYARD_HOME: home });
+  const initialStore = new StateStore(paths.database);
+  initialStore.db
+    .prepare("INSERT INTO projects(id, name, root_path, created_at) VALUES ('p', 'repo', ?, ?)")
+    .run(repo, now());
+  initialStore.close();
+
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  await writeFile(
+    path.join(bin, "git"),
+    `#!/usr/bin/env bash\nset -e\nif [[ "$1 $2" == "worktree add" ]]; then\n  : > ${JSON.stringify(gateStarted)}\n  while [[ ! -e ${JSON.stringify(gateRelease)} ]]; do sleep 0.01; done\nfi\nexec ${JSON.stringify(realGit)} "$@"\n`,
+  );
+  await writeFile(
+    path.join(bin, "tmux"),
+    `#!/usr/bin/env bash\nset -e\nstate=${JSON.stringify(tmuxState)}\ncase "$1" in\n  has-session) [[ -f "$state" ]] ;;\n  new-session|new-window) printf '%s\\n' "$6" >> "$state" ;;\n  list-windows) i=0; while IFS= read -r name; do i=$((i+1)); printf '@%s\\t%s\\n' "$i" "$name"; done < "$state" ;;\n  display-message) echo 0 ;;\n  kill-window) target="\${3#@}"; temp="$state.tmp"; awk -v target="$target" 'NR != target' "$state" > "$temp"; mv "$temp" "$state" ;;\n  *) : ;;\nesac\n`,
+  );
+  await chmod(path.join(bin, "git"), 0o755);
+  await chmod(path.join(bin, "tmux"), 0o755);
+  const env = { ...process.env, SWITCHYARD_HOME: home, PATH: `${bin}:${process.env.PATH}` };
+  delete env.TMUX;
+  const cliStartup = run(["task", "create", "p", "Concurrent startup"], env);
+  const reconcilerStore = new StateStore(paths.database);
+
+  try {
+    await waitForFile(gateStarted);
+    const task = reconcilerStore.listTasks()[0];
+    assert.ok(task);
+    assert.equal(task.state, "starting");
+    assert.equal(reconcilerStore.getWorkspace(task.id)?.provisioned, 0);
+    assert.notEqual(reconcilerStore.getWorkspace(task.id)?.provisioner_pid, null);
+    assert.ok(reconcilerStore.getWorkspace(task.id)?.provisioner_token);
+    await reconcile(reconcilerStore, paths);
+    assert.equal(reconcilerStore.getTask(task.id)?.state, "starting");
+    assert.equal(reconcilerStore.getWorkspace(task.id)?.provisioned, 0);
+    assert.equal(reconcilerStore.getLiveWorker(task.id), undefined);
+  } finally {
+    await writeFile(gateRelease, "release\n");
+  }
+
+  const result = await cliStartup;
+  assert.equal(result.code, 0, result.stderr);
+  const taskId = result.stdout.trim();
+  assert.ok(taskId);
+  assert.equal(reconcilerStore.getTask(taskId)?.state, "running");
+  assert.equal(reconcilerStore.getWorkspace(taskId)?.provisioned, 1);
+  assert.ok(reconcilerStore.getActiveWorker(taskId));
+  assert.equal((await readFile(tmuxState, "utf8")).trim().split(/\r?\n/).length, 1);
+  reconcilerStore.close();
 });
 
 test("project add rejects all SwitchYard-managed checkouts", async () => {

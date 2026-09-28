@@ -41,7 +41,7 @@ test("migrations are repeatable and durable", async () => {
   assert.equal(reopened.listTasks().length, 1);
   assert.equal(
     (reopened.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-    4,
+    5,
   );
   reopened.close();
 });

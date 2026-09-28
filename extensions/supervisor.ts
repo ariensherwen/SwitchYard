@@ -54,6 +54,7 @@ const SUPERVISOR_TOOLS = [
 export default function supervisorExtension(pi: PiExtensionApi) {
   let stopWakePump: (() => void) | undefined;
   let delivering = false;
+  const awaitingConsumption = new Set<string>();
   const result = (value: unknown) => {
     const safeValue = redactInternalIds(value);
     return {
@@ -326,32 +327,56 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     },
   });
 
+  async function acknowledgeSupervisorMessages() {
+    const ids = [...awaitingConsumption];
+    if (ids.length === 0) return;
+    try {
+      const { store } = await openSwitchYard();
+      try {
+        store.transaction(() => {
+          for (const id of ids) markDelivered(store, id);
+        });
+      } finally {
+        store.close();
+      }
+    } finally {
+      for (const id of ids) awaitingConsumption.delete(id);
+    }
+  }
+
   async function deliverSupervisorMessages() {
     if (delivering) return;
     delivering = true;
+    const queuedIds: string[] = [];
     try {
       const { paths, store } = await openSwitchYard();
       try {
         pi.setActiveTools(SUPERVISOR_TOOLS);
         await reconcile(store, paths);
-        const rows = store.db
-          .prepare(
-            "SELECT * FROM messages WHERE recipient='supervisor' AND state='pending' ORDER BY created_at, id",
-          )
-          .all() as unknown as MessageRecord[];
+        const rows = (
+          store.db
+            .prepare(
+              "SELECT * FROM messages WHERE recipient='supervisor' AND state='pending' ORDER BY created_at, id",
+            )
+            .all() as unknown as MessageRecord[]
+        ).filter((message) => !awaitingConsumption.has(message.id));
         if (rows.length === 0) return;
+        for (const message of rows) {
+          awaitingConsumption.add(message.id);
+          queuedIds.push(message.id);
+        }
         await pi.sendUserMessage(
           rows.map((row) => humanizeMessage(store, row)).join("\n\n---\n\n"),
           {
             deliverAs: "steer",
           },
         );
-        store.transaction(() => {
-          for (const message of rows) markDelivered(store, message.id);
-        });
       } finally {
         store.close();
       }
+    } catch (error) {
+      for (const id of queuedIds) awaitingConsumption.delete(id);
+      throw error;
     } finally {
       delivering = false;
     }
@@ -378,6 +403,7 @@ export default function supervisorExtension(pi: PiExtensionApi) {
     }
     await deliverSupervisorMessages();
   });
+  pi.on("agent_settled", acknowledgeSupervisorMessages);
   pi.on("agent_end", deliverSupervisorMessages);
   pi.on("session_shutdown", async () => {
     stopWakePump?.();

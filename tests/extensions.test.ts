@@ -12,6 +12,7 @@ import supervisorExtension from "../extensions/supervisor.ts";
 import workerExtension from "../extensions/worker.ts";
 import { ensureSwitchYardHome } from "../src/home.ts";
 import { enqueueMessage, signalWake } from "../src/inbox.ts";
+import { retireWorker } from "../src/runtime.ts";
 import { now, StateStore } from "../src/state.ts";
 import { createTask, transition } from "../src/tasks.ts";
 
@@ -165,6 +166,32 @@ test("Reviewer receives an initial review request as a Pi user message", async (
   assert.ok(initialMessage);
   assert.match(initialMessage.text, /Begin the independent review/);
   assert.deepEqual(initialMessage.options, { deliverAs: "steer" });
+});
+
+test("Supervisor replays a queued Message until Pi settles its steering", async () => {
+  const { store, taskId, workerId } = await fixture();
+  retireWorker(store, taskId, workerId, "test setup");
+  transition(store, taskId, "running", "cancelled", "task.cancelled");
+  enqueueMessage(store, taskId, "supervisor", "Do not lose this notification");
+
+  const first = fakePi();
+  supervisorExtension(first.api);
+  await first.handlers.get("session_start")?.();
+  assert.equal(first.messages.length, 1);
+  assert.match(first.messages[0]?.text ?? "", /Do not lose this notification/);
+  assert.equal(store.listPendingMessages(taskId, "supervisor").length, 1);
+  await first.handlers.get("session_shutdown")?.();
+
+  const replacement = fakePi();
+  supervisorExtension(replacement.api);
+  await replacement.handlers.get("session_start")?.();
+  assert.equal(replacement.messages.length, 1);
+  assert.match(replacement.messages[0]?.text ?? "", /Do not lose this notification/);
+  assert.equal(store.listPendingMessages(taskId, "supervisor").length, 1);
+  await replacement.handlers.get("agent_settled")?.();
+  assert.equal(store.listPendingMessages(taskId, "supervisor").length, 0);
+  await replacement.handlers.get("session_shutdown")?.();
+  store.close();
 });
 
 test("Supervisor steering resumes a waiting Task through the shared domain operation", async () => {
